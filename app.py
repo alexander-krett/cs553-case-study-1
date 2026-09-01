@@ -1,7 +1,8 @@
 import gradio as gr
 from huggingface_hub import InferenceClient
+import spaces
 
-
+@spaces.GPU
 def respond(
     message,
     history: list[dict[str, str]],
