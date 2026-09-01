@@ -18,5 +18,8 @@ An example chatbot using [Gradio](https://gradio.app), [`huggingface_hub`](https
 
 Pushes to `main` are automatically mirrored to the
 [`akrett/cs553-ml-ops`](https://huggingface.co/spaces/akrett/cs553-ml-ops) Hugging Face
-Space. Add a GitHub Actions repository secret named `HF_TOKEN` with permission to
-write to the Space before running the workflow.
+Space, then a deployment notification is sent to Discord. Before running the
+workflow, add these GitHub Actions repository secrets:
+
+- `HF_TOKEN`: a Hugging Face token with permission to write to the Space.
+- `DISCORD_WEBHOOK`: the URL of the Discord webhook that receives notifications.

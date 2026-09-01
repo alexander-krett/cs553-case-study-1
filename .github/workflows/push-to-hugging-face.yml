@@ -1,4 +1,4 @@
-name: Push to Hugging Face
+name: Deploy and notify Discord
 
 on:
   push:
@@ -29,3 +29,17 @@ jobs:
           git push --force \
             "https://akrett:${HF_TOKEN}@huggingface.co/spaces/akrett/cs553-ml-ops.git" \
             HEAD:main
+
+      - name: Notify Discord
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          jq -n \
+            --arg content "Deployed akrett/cs553-ml-ops to Hugging Face successfully. ${RUN_URL}" \
+            '{content: $content}' \
+            > discord-payload.json
+          curl --fail-with-body --silent --show-error \
+            -H "Content-Type: application/json" \
+            --data @discord-payload.json \
+            "${DISCORD_WEBHOOK}"
