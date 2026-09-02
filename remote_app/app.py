@@ -1,0 +1,344 @@
+from __future__ import annotations
+
+import os
+import sys
+import time
+from pathlib import Path
+
+import gradio as gr
+import spaces
+from huggingface_hub import InferenceClient
+
+
+# Allow this app to import ../shared/prompts.py
+# Make the shared project directory importable
+# remote_app/ and shared/ are sibling directories.
+# Adding the project root to sys.path lets this application import
+# shared/prompts.py without duplicating prompt logic.
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+# Import the prompt logic shared by both the remote and local apps.
+from shared.prompts import (  # noqa: E402
+    REVIEW_TYPES,
+    SYSTEM_PROMPT,
+    build_prompt,
+)
+
+
+# Remote model configuration
+# The environment variable lets us change the model later without
+# editing the Python source code. If REMOTE_MODEL is not defined, 
+# the application uses the starter model provided in the class example.
+REMOTE_MODEL = os.getenv(
+    "REMOTE_MODEL",
+    "openai/gpt-oss-20b",
+)
+
+
+# Remote inference
+# The course starter uses ZeroGPU, so we keep the spaces.GPU
+# decorator here. The actual language-model inference is still
+# remotely through Hugging Face InferenceClient.
+
+@spaces.GPU(duration=30)
+def remote_resume_review(
+    resume_text,
+    review_type,
+    job_description,
+    max_tokens,
+    temperature,
+    hf_token: gr.OAuthToken | None,
+):
+    """
+    Analyze a resume using a remotely hosted model through
+    Hugging Face InferenceClient.
+    """
+    # Require Hugging Face authentication
+    # The OAuth token is provided automatically by Gradio after
+    # the user signs in through the LoginButton.
+    if hf_token is None:
+        raise gr.Error(
+            "Please sign in with Hugging Face before "
+            "using the remote model."
+        )
+
+    # Build and validate user input and construct the shared prompt
+    try:
+        prompt = build_prompt(
+            resume_text=resume_text,
+            review_type=review_type,
+            job_description=job_description,
+        )
+
+    except ValueError as error:
+        # Convert normal Python validation errors into a message
+        # that is displayed cleanly inside the Gradio interface.
+        raise gr.Error(str(error)) from error
+
+    # Create the Hugging Face inference client
+    # The user's OAuth token is used to authorize the remote
+    # inference request.
+    client = InferenceClient(
+        token=hf_token.token,
+        model=REMOTE_MODEL,
+    )
+
+    # Create the chat-format messages
+    # The system prompt defines the model's overall behavior.
+    # The user prompt contains the resume, review mode, and
+    # optional job description.
+    messages = [
+        {
+            "role": "system",
+            "content": SYSTEM_PROMPT,
+        },
+        {
+            "role": "user",
+            "content": prompt,
+        },
+    ]
+
+
+    # Measure remote inference latency.
+    start_time = time.perf_counter()
+    
+    # Send the request to the remotely hosted model.
+    try:
+        completion = client.chat_completion(
+            messages=messages,
+            max_tokens=int(max_tokens),
+            temperature=float(temperature),
+            top_p=0.9,
+            stream=False,
+        )
+    # For the first version, display remote API errors cleanly.
+    # Later, this block can be replaced with automatic failover
+    # to the local model for the extra-credit requirement.
+    except Exception as error:
+        raise gr.Error(
+            f"Remote inference failed: {error}"
+        ) from error
+
+    # Stop measuring once the model response has arrived.
+    elapsed_time = time.perf_counter() - start_time
+
+    # Extract the generated response
+    response = (
+        completion
+        .choices[0]
+        .message
+        .content
+    )
+    # Make sure the API returned usable text.
+    if not response or not response.strip():
+        raise gr.Error(
+            "The remote model returned an empty response."
+        )
+
+    # Build metadata displayed below the model response
+    # These measurements will later help us compare the local
+    # and remote products in the project report.
+    model_information = f"""
+Inference Information
+
+Model: `{REMOTE_MODEL}`
+
+Execution: Remote Hugging Face API
+
+Response time: {elapsed_time:.2f} seconds
+"""
+
+
+    return response, model_information
+
+
+# Gradio interface
+
+with gr.Blocks(
+    title="ResumeLens AI - Remote"
+) as demo:
+
+    with gr.Sidebar():
+
+        gr.Markdown(
+            """
+            ## Hugging Face
+
+            Sign in before using the remote inference model.
+            """
+        )
+        # Provides the OAuth token used by InferenceClient.
+        gr.LoginButton()
+
+        gr.Markdown("## Generation Settings")
+        
+        # Controls the maximum amount of text generated by the LLM.
+        max_tokens = gr.Slider(
+            minimum=128,
+            maximum=512,
+            value=300,
+            step=32,
+            label="Maximum Response Tokens",
+        )
+        # Controls randomness in model generation.
+        # Lower values generally produce more consistent responses,
+        # which is useful for resume evaluation.
+        temperature = gr.Slider(
+            minimum=0.0,
+            maximum=1.0,
+            value=0.3,
+            step=0.1,
+            label="Temperature",
+        )
+
+    # Application title and privacy notice
+    gr.Markdown(
+        """
+        # ResumeLens AI
+
+        ### Remote LLM Resume Reviewer
+
+        Analyze a resume using a remotely hosted language model.
+
+        For this class demonstration, use a synthetic or sanitized
+        resume whenever possible.
+        """
+    )
+
+    # Main two-column layout
+    with gr.Row():
+        # Left side: User inputs
+        
+        # Input Column
+
+        with gr.Column():
+            # Main resume text supplied by the user.
+            resume_text = gr.Textbox(
+                label="Resume",
+                placeholder=(
+                    "Paste your resume text here..."
+                ),
+                lines=20,
+            )
+
+            # Select which type of review the model should perform.
+            review_type = gr.Dropdown(
+                choices=REVIEW_TYPES,
+                value="General Resume Review",
+                label="Review Type",
+            )
+
+            # Used mainly for the Job Description Match mode.
+            job_description = gr.Textbox(
+                label="Job Description",
+                placeholder=(
+                    "Optional unless using "
+                    "'Job Description Match'."
+                ),
+                lines=10,
+            )
+
+            # Clicking this button sends all inputs to the model.
+            analyze_button = gr.Button(
+                "Analyze Resume",
+                variant="primary",
+            )
+
+        # Right side: Model outputs
+        # Output Column
+        with gr.Column():
+            # Main resume-review feedback generated by the model.
+            feedback = gr.Markdown(
+                """
+                ### Resume Feedback
+
+                Your analysis will appear here.
+                """
+            )
+
+            # Displays model name, inference type, and response time.
+            model_information = gr.Markdown()
+
+
+    # Example inputs for demonstrations
+    # These make it easy to demonstrate the application during
+    # the project presentation without manually typing a resume.
+    gr.Examples(
+        examples=[
+            [
+                """
+EDUCATION
+B.S. Computer Science
+
+EXPERIENCE
+Research Assistant
+- Worked with machine learning models.
+- Helped analyze data.
+- Used Python.
+""",
+                "Bullet Point Strength",
+                "",
+            ],
+
+            [
+                """
+EDUCATION
+M.S. Data Science
+
+SKILLS
+Python, PyTorch, SQL
+
+EXPERIENCE
+Research Assistant
+- Developed predictive models for mobility data.
+- Evaluated models using held-out datasets.
+""",
+                "Job Description Match",
+                """
+Machine Learning Engineer Intern
+
+Requirements:
+- Python
+- PyTorch
+- Git
+- Docker
+- AWS
+""",
+            ],
+        ],
+
+        inputs=[
+            resume_text,
+            review_type,
+            job_description,
+        ],
+    )
+
+    # Connect the button to the remote inference function
+
+    analyze_button.click(
+        fn=remote_resume_review,
+
+        inputs=[
+            resume_text,
+            review_type,
+            job_description,
+            max_tokens,
+            temperature,
+        ],
+
+        outputs=[
+            feedback,
+            model_information,
+        ],
+    )
+
+# Enable Gradio request queuing before execution.
+demo.queue()
+
+# Launch the application when app.py is executed directly.
+if __name__ == "__main__":
+    demo.launch()
