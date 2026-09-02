@@ -1,5 +1,5 @@
 ---
-title: HaikuGPT - CS553 - MLOps Case Study 1 Homework
+title: Resume Reviewer - CS553 - MLOps Case Study 1 Homework
 emoji: 💬
 colorFrom: yellow
 colorTo: purple
