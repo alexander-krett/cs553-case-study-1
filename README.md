@@ -12,7 +12,19 @@ hf_oauth_scopes:
 - inference-api
 ---
 
-An example chatbot using [Gradio](https://gradio.app), [`huggingface_hub`](https://huggingface.co/docs/huggingface_hub/v0.22.2/en/index), and the [Hugging Face Inference API](https://huggingface.co/docs/api-inference/index).
+ResumeLens AI reviews resumes using a single Gradio interface with two inference
+modes:
+
+- **Local** runs `HuggingFaceTB/SmolLM2-360M-Instruct` on Hugging Face ZeroGPU.
+- **Remote** uses `openai/gpt-oss-20b` through the Hugging Face Inference API.
+
+Choose the inference mode in the sidebar, paste a synthetic or sanitized resume,
+select a review type, and click **Analyze Resume**. Remote inference requires a
+Hugging Face sign-in; Local inference does not. Set the `REMOTE_MODEL` environment
+variable to use a different remote model.
+
+The root `app.py` is the deployment entrypoint, and `prompts.py` contains prompt
+construction and input validation shared by both inference modes.
 
 ## Deployment
 

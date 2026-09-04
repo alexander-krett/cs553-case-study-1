@@ -1,5 +1,5 @@
 """
-Shared prompt construction for ResumeLens AI.
+Prompt construction for ResumeLens AI.
 
 This module intentionally contains no Gradio, Transformers,
 or Hugging Face API code so that it can be tested independently.
@@ -108,7 +108,7 @@ def build_prompt(
     job_description: str = "",
 ) -> str:
     """
-    Build a resume-review prompt shared by the local and remote models.
+    Build a resume-review prompt used by the local and remote models.
 
     Parameters
     resume_text: Resume text supplied by the user.
