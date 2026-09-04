@@ -1,2 +1,5 @@
+# Lightweight dependencies for unit tests; inference is mocked.
 pytest>=8.0.0
-gradio>=4.0.0
+gradio[oauth]>=4.0.0
+huggingface_hub>=0.22.2
+spaces

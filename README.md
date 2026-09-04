@@ -36,9 +36,13 @@ Automated CI/CD runs on every push to `main` via GitHub Actions:
 
 To run tests locally:
 ```bash
-pip install -r requirements.txt -r requirements-dev.txt
+python -m pip install -r requirements-dev.txt
 python -m pytest
 ```
+
+CI installs only `requirements-dev.txt`, without PyTorch or Transformers.
+Inference is mocked in unit tests; GPU execution and model quality are not tested.
+Hugging Face uses `requirements.txt` for the full application dependencies.
 
 Before running the workflow, ensure these GitHub Actions repository secrets are configured:
 - `HF_TOKEN`: a Hugging Face token with permission to write to the Space.
