@@ -1,9 +1,11 @@
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import pytest
 
-import app
+# Unit tests use explicit fake tokens and must not require a local HF login.
+with patch("gradio.oauth._get_mocked_oauth_info", return_value={}):
+    import app
 
 
 COMMON_ARGS = (

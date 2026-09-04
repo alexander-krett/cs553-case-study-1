@@ -1,4 +1,4 @@
-from prompts import build_prompt
+from src.prompts import build_prompt
 
 
 def test_build_prompt_includes_resume_and_review_instructions():

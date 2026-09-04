@@ -8,7 +8,8 @@ import gradio as gr
 import spaces
 from huggingface_hub import InferenceClient
 
-from prompts import REVIEW_TYPES, SYSTEM_PROMPT, build_prompt
+from src.examples import EXAMPLES
+from src.prompts import REVIEW_TYPES, SYSTEM_PROMPT, build_prompt
 
 
 LOCAL_MODEL = "Qwen/Qwen3-4B-Instruct-2507"
@@ -229,41 +230,7 @@ ZeroGPU or a remotely hosted model through the Hugging Face Inference API.
             model_information = gr.Markdown()
 
     gr.Examples(
-        examples=[
-            [
-                """EDUCATION
-B.S. Computer Science
-
-EXPERIENCE
-Research Assistant
-- Worked with machine learning models.
-- Helped analyze data.
-- Used Python.""",
-                "Bullet Point Strength",
-                "",
-            ],
-            [
-                """EDUCATION
-M.S. Data Science
-
-SKILLS
-Python, PyTorch, SQL
-
-EXPERIENCE
-Research Assistant
-- Developed predictive models for mobility data.
-- Evaluated models using held-out datasets.""",
-                "Job Description Match",
-                """Machine Learning Engineer Intern
-
-Requirements:
-- Python
-- PyTorch
-- Git
-- Docker
-- AWS""",
-            ],
-        ],
+        examples=EXAMPLES,
         inputs=[resume_text, review_type, job_description],
     )
 

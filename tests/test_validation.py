@@ -1,6 +1,6 @@
 import pytest
 
-from prompts import build_prompt
+from src.prompts import build_prompt
 
 
 def test_empty_resume_is_rejected():

@@ -22,6 +22,23 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cpu
+          pip install -r requirements-dev.txt
+
+      - name: Run pytests
+        id: pytest
+        run: |
+          python -m pytest -v tests/
+
       - name: Push main to Hugging Face Space
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
@@ -31,14 +48,85 @@ jobs:
             HEAD:main
 
       - name: Notify Discord
+        if: always()
         env:
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          RUN_NUMBER: ${{ github.run_number }}
+          JOB_STATUS: ${{ job.status }}
+          PYTEST_OUTCOME: ${{ steps.pytest.outcome }}
+          SERVER_URL: ${{ github.server_url }}
+          REPO: ${{ github.repository }}
+          BRANCH: ${{ github.ref_name }}
+          EVENT_NAME: ${{ github.event_name }}
+          ACTOR: ${{ github.actor }}
         run: |
+          if [ -z "$DISCORD_WEBHOOK" ]; then
+            echo "DISCORD_WEBHOOK is not set; skipping Discord notification."
+            exit 0
+          fi
+
+          COMMIT_MSG=$(git log -1 --pretty=format:'%s')
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          COMMIT_URL="${SERVER_URL}/${REPO}/commit/${SHORT_SHA}"
+          SPACE_URL="https://huggingface.co/spaces/akrett/cs553-ml-ops"
+          TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+          if [ "$JOB_STATUS" = "success" ]; then
+            TITLE="🚀 CI/CD Pipeline Succeeded"
+            DESC="All tests passed and code was synced to Hugging Face Spaces. The Space rebuild was triggered; application readiness has not been checked."
+            COLOR=3066993
+            TEST_VAL="✅ All tests passed"
+            DEPLOY_VAL="✅ Code synced; Space rebuild triggered"
+          else
+            TITLE="❌ CI/CD Pipeline Failed"
+            DESC="The CI/CD pipeline encountered a failure. Deployment to Hugging Face Spaces was aborted."
+            COLOR=15158332
+            if [ "$PYTEST_OUTCOME" = "success" ]; then
+              TEST_VAL="✅ Tests passed"
+              DEPLOY_VAL="❌ Deployment step failed"
+            elif [ "$PYTEST_OUTCOME" = "failure" ]; then
+              TEST_VAL="❌ Pytests failed"
+              DEPLOY_VAL="⚠️ Skipped (tests failed)"
+            else
+              TEST_VAL="⚠️ Setup/Dependency failure"
+              DEPLOY_VAL="⚠️ Skipped"
+            fi
+          fi
+
           jq -n \
-            --arg content "Deployed akrett/cs553-ml-ops to Hugging Face successfully. ${RUN_URL}" \
-            '{content: $content}' \
-            > discord-payload.json
+            --arg title "$TITLE" \
+            --arg desc "$DESC" \
+            --argjson color "$COLOR" \
+            --arg commit "[\`${SHORT_SHA}\`](${COMMIT_URL}) - ${COMMIT_MSG}" \
+            --arg author "$ACTOR" \
+            --arg branch "${BRANCH} (${EVENT_NAME})" \
+            --arg tests "$TEST_VAL" \
+            --arg deploy "$DEPLOY_VAL" \
+            --arg space "[akrett/cs553-ml-ops](${SPACE_URL})" \
+            --arg run "[Run #${RUN_NUMBER}](${RUN_URL})" \
+            --arg timestamp "$TIMESTAMP" \
+            '{
+              embeds: [
+                {
+                  title: $title,
+                  description: $desc,
+                  color: $color,
+                  fields: [
+                    {name: "Commit", value: $commit, inline: false},
+                    {name: "Author", value: $author, inline: true},
+                    {name: "Branch / Event", value: $branch, inline: true},
+                    {name: "Tests", value: $tests, inline: true},
+                    {name: "Deployment", value: $deploy, inline: true},
+                    {name: "Hugging Face Space", value: $space, inline: true},
+                    {name: "Workflow Run", value: $run, inline: true}
+                  ],
+                  footer: {text: "GitHub Actions CI/CD • CS553 Case Study 1"},
+                  timestamp: $timestamp
+                }
+              ]
+            }' > discord-payload.json
+
           curl --fail-with-body --silent --show-error \
             -H "Content-Type: application/json" \
             --data @discord-payload.json \
