@@ -44,6 +44,35 @@ def test_remote_mode_requires_oauth():
         app.remote_resume_review(*COMMON_ARGS, None)
 
 
+def test_remote_request_uses_low_reasoning_effort(monkeypatch):
+    message = SimpleNamespace(content="Useful feedback")
+    choice = SimpleNamespace(message=message, finish_reason="stop")
+    client = Mock()
+    client.chat_completion.return_value = SimpleNamespace(choices=[choice])
+    monkeypatch.setattr(app, "InferenceClient", Mock(return_value=client))
+
+    result = app.remote_resume_review(
+        *COMMON_ARGS, SimpleNamespace(token="secret")
+    )
+
+    assert result[0] == "Useful feedback"
+    assert client.chat_completion.call_args.kwargs["extra_body"] == {
+        "reasoning_effort": "low"
+    }
+    assert client.chat_completion.call_args.kwargs["max_tokens"] == 1536
+
+
+def test_empty_remote_response_reports_finish_reason(monkeypatch):
+    message = SimpleNamespace(content="")
+    choice = SimpleNamespace(message=message, finish_reason="length")
+    client = Mock()
+    client.chat_completion.return_value = SimpleNamespace(choices=[choice])
+    monkeypatch.setattr(app, "InferenceClient", Mock(return_value=client))
+
+    with pytest.raises(app.gr.Error, match="finish reason: length"):
+        app.remote_resume_review(*COMMON_ARGS, SimpleNamespace(token="secret"))
+
+
 def test_invalid_mode_is_rejected():
     with pytest.raises(app.gr.Error, match="Invalid inference mode"):
         app.analyze_resume(*COMMON_ARGS, "Other", None)
