@@ -17,7 +17,9 @@ def test_local_mode_routes_with_automatic_failover(monkeypatch):
     monkeypatch.setattr(app, "local_resume_review", local)
     monkeypatch.setattr(app, "remote_resume_review", remote)
 
-    result = app.analyze_resume(*COMMON_ARGS, True, "Local", None)
+    result = app.analyze_resume(
+        *COMMON_ARGS, True, "Local", app.REMOTE_PRIMARY_MODEL, None
+    )
 
     assert result == ("local feedback", "local info")
     local.assert_called_once_with(*COMMON_ARGS)
@@ -29,17 +31,69 @@ def test_remote_mode_routes_with_automatic_failover(monkeypatch):
     remote = Mock(return_value=("remote feedback", "remote info"))
     monkeypatch.setattr(app, "remote_resume_review", remote)
 
-    result = app.analyze_resume(*COMMON_ARGS, True, "Remote", token)
+    result = app.analyze_resume(
+        *COMMON_ARGS, True, "Remote", app.REMOTE_PRIMARY_MODEL, token
+    )
 
     assert result == ("remote feedback", "remote info")
     remote.assert_called_once_with(*COMMON_ARGS, token)
+
+
+def test_remote_chain_failure_crosses_to_local(monkeypatch):
+    token = SimpleNamespace(token="secret")
+    remote = Mock(side_effect=app.gr.Error("remote chain failed"))
+    local = Mock(return_value=("local feedback", "Response time: 1.00 seconds"))
+    monkeypatch.setattr(app, "remote_resume_review", remote)
+    monkeypatch.setattr(app, "local_resume_review", local)
+
+    result = app.analyze_resume(
+        *COMMON_ARGS, True, "Remote", app.REMOTE_PRIMARY_MODEL, token
+    )
+
+    assert result[0] == "local feedback"
+    assert "Switched from Remote to Local" in result[1]
+    remote.assert_called_once_with(*COMMON_ARGS, token)
+    local.assert_called_once_with(*COMMON_ARGS)
+
+
+def test_local_chain_failure_crosses_to_remote(monkeypatch):
+    token = SimpleNamespace(token="secret")
+    local = Mock(side_effect=app.gr.Error("local chain failed"))
+    remote = Mock(return_value=("remote feedback", "Response time: 1.00 seconds"))
+    monkeypatch.setattr(app, "local_resume_review", local)
+    monkeypatch.setattr(app, "remote_resume_review", remote)
+
+    result = app.analyze_resume(
+        *COMMON_ARGS, True, "Local", app.REMOTE_PRIMARY_MODEL, token
+    )
+
+    assert result[0] == "remote feedback"
+    assert "Switched from Local to Remote" in result[1]
+    local.assert_called_once_with(*COMMON_ARGS)
+    remote.assert_called_once_with(*COMMON_ARGS, token)
+
+
+def test_all_execution_failures_are_combined(monkeypatch):
+    monkeypatch.setattr(
+        app, "local_resume_review", Mock(side_effect=app.gr.Error("local failed"))
+    )
+    monkeypatch.setattr(
+        app, "remote_resume_review", Mock(side_effect=app.gr.Error("remote failed"))
+    )
+
+    with pytest.raises(app.gr.Error, match="All inference options failed"):
+        app.analyze_resume(
+            *COMMON_ARGS, True, "Remote", app.REMOTE_PRIMARY_MODEL, None
+        )
 
 
 def test_manual_model_selection_bypasses_failover(monkeypatch):
     local = Mock(return_value=("feedback", "info"))
     monkeypatch.setattr(app, "local_resume_review", local)
 
-    result = app.analyze_resume(*COMMON_ARGS, False, app.LOCAL_BACKUP_MODEL, None)
+    result = app.analyze_resume(
+        *COMMON_ARGS, False, "Remote", app.LOCAL_BACKUP_MODEL, None
+    )
 
     assert result == ("feedback", "info")
     local.assert_called_once_with(*COMMON_ARGS, models=[app.LOCAL_BACKUP_MODEL])
@@ -141,26 +195,23 @@ def test_empty_remote_response_can_trigger_failover(monkeypatch):
     assert "Backup model used" in result[1]
 
 
-def test_execution_choices_follow_failover_setting():
-    failover = app.execution_choices(True).get_config()
-    manual = app.execution_choices(False).get_config()
+def test_execution_controls_follow_failover_setting():
+    mode_on, model_off = app.execution_control_visibility(True)
+    mode_off, model_on = app.execution_control_visibility(False)
 
-    assert failover["value"] == "Remote"
-    assert [choice[1] for choice in failover["choices"]] == ["Remote", "Local"]
-    assert manual["value"] == app.REMOTE_PRIMARY_MODEL
-    assert [choice[1] for choice in manual["choices"]] == [
-        app.REMOTE_PRIMARY_MODEL,
-        app.REMOTE_BACKUP_MODEL,
-        app.LOCAL_PRIMARY_MODEL,
-        app.LOCAL_BACKUP_MODEL,
-    ]
+    assert mode_on.get_config()["visible"] is True
+    assert model_off.get_config()["visible"] is False
+    assert mode_off.get_config()["visible"] is False
+    assert model_on.get_config()["visible"] is True
 
 
 def test_invalid_mode_is_rejected():
     with pytest.raises(app.gr.Error, match="Invalid inference mode"):
-        app.analyze_resume(*COMMON_ARGS, True, "Other", None)
+        app.analyze_resume(
+            *COMMON_ARGS, True, "Other", app.REMOTE_PRIMARY_MODEL, None
+        )
 
 
 def test_invalid_manual_model_is_rejected():
     with pytest.raises(app.gr.Error, match="Invalid model"):
-        app.analyze_resume(*COMMON_ARGS, False, "unknown/model", None)
+        app.analyze_resume(*COMMON_ARGS, False, "Remote", "unknown/model", None)

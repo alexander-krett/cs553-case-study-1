@@ -15,17 +15,20 @@ hf_oauth_scopes:
 ResumeLens AI reviews resumes using a single Gradio interface with two inference
 modes and automatic failover:
 
-- **Local** runs `Qwen/Qwen3.5-4B` on Hugging Face ZeroGPU and falls back to
-  `ibm-granite/granite-4.2-3b`.
+- **Local-first** tries `Qwen/Qwen3.5-4B` and
+  `ibm-granite/granite-4.2-3b` on Hugging Face ZeroGPU, then crosses to the
+  remote models if both fail.
 - **Remote** uses `openai/gpt-oss-20b` through the Hugging Face Inference API
-  and falls back to `zai-org/GLM-5.3-Flash`.
+  and falls back to `zai-org/GLM-5.3-Flash`, then crosses to the local models
+  if both fail.
 
 Choose the inference mode in the sidebar, paste a synthetic or sanitized resume,
 select a review type, and click **Analyze Resume**. Remote inference requires a
 Hugging Face sign-in; Local inference does not. Automatic failover is enabled by
-default. Under **Advanced settings**, the unified **Execution** selector shows
-Local/Remote chains when failover is on and individual models when it is off.
-The shared generation controls are there as well.
+default. Under **Advanced settings**, a Local/Remote toggle chooses which mode
+runs first when failover is on. Turning failover off replaces it with an
+individual model selector. The shared generation controls are there as well.
+Crossing into Remote requires Hugging Face sign-in.
 
 Override the defaults with `LOCAL_PRIMARY_MODEL`, `LOCAL_BACKUP_MODEL`,
 `REMOTE_PRIMARY_MODEL`, and `REMOTE_BACKUP_MODEL`.

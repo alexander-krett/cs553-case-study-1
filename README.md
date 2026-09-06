@@ -3,10 +3,12 @@
 ResumeLens AI is a Gradio application that reviews resumes against a job
 description. It supports two inference modes with automatic failover:
 
-- **Local** runs `Qwen/Qwen3.5-4B` on Hugging Face ZeroGPU and falls back to
-  `ibm-granite/granite-4.2-3b`.
+- **Local-first** tries `Qwen/Qwen3.5-4B` and
+  `ibm-granite/granite-4.2-3b` on Hugging Face ZeroGPU, then crosses to the
+  remote models if both fail.
 - **Remote** uses `openai/gpt-oss-20b` through the Hugging Face Inference API
-  and falls back to `zai-org/GLM-5.3-Flash`.
+  and falls back to `zai-org/GLM-5.3-Flash`, then crosses to the local models
+  if both fail.
 
 Use synthetic or sanitized resumes only. Choose an inference mode, paste a
 resume, select a review type, and click **Analyze Resume**. Remote inference
@@ -15,10 +17,11 @@ enabled by default. Disable it to select any of the four models directly.
 
 The default model IDs can be changed with `LOCAL_PRIMARY_MODEL`,
 `LOCAL_BACKUP_MODEL`, `REMOTE_PRIMARY_MODEL`, and `REMOTE_BACKUP_MODEL`.
-Under **Advanced settings**, the unified **Execution** selector shows
-Local/Remote chains when failover is on and individual models when it is off.
-The shared generation controls are there as well, and every model uses the same
-response-token budget.
+Under **Advanced settings**, a Local/Remote toggle chooses which mode runs first
+when failover is on. Turning failover off replaces the toggle with an individual
+model selector. The shared generation controls are there as well, and every model
+uses the same response-token budget. Crossing into Remote requires Hugging Face
+sign-in.
 
 The app is deployed at [akrett/cs553-ml-ops](https://huggingface.co/spaces/akrett/cs553-ml-ops).
 

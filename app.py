@@ -23,10 +23,6 @@ MODEL_EXECUTION = {
     REMOTE_PRIMARY_MODEL: "Remote",
     REMOTE_BACKUP_MODEL: "Remote",
 }
-FAILOVER_CHOICES = [
-    ("Remote — GPT-OSS 20B → GLM 5.3 Flash", "Remote"),
-    ("Local — Qwen 3.5 4B → Granite 4.2 3B", "Local"),
-]
 MODEL_CHOICES = [
     ("Remote — GPT-OSS 20B", REMOTE_PRIMARY_MODEL),
     ("Remote — GLM 5.3 Flash", REMOTE_BACKUP_MODEL),
@@ -205,6 +201,52 @@ def remote_resume_review(
     raise gr.Error("Remote inference failed. " + " | ".join(failures))
 
 
+def automatic_resume_review(
+    resume_text,
+    review_type,
+    job_description,
+    max_tokens,
+    temperature,
+    first_execution,
+    hf_token: gr.OAuthToken | None,
+):
+    """Try both models in one execution mode, then cross to the other mode."""
+    if first_execution not in {"Local", "Remote"}:
+        raise gr.Error(f"Invalid inference mode: {first_execution}")
+
+    # Reject user-input errors before attempting infrastructure failover.
+    _validated_prompt(resume_text, review_type, job_description)
+    common_args = (
+        resume_text,
+        review_type,
+        job_description,
+        max_tokens,
+        temperature,
+    )
+    attempts = (
+        ("Local", lambda: local_resume_review(*common_args)),
+        ("Remote", lambda: remote_resume_review(*common_args, hf_token)),
+    )
+    if first_execution == "Remote":
+        attempts = tuple(reversed(attempts))
+
+    failures = []
+    for index, (execution, review) in enumerate(attempts):
+        try:
+            response, information = review()
+            if index > 0:
+                information = information.replace(
+                    "Response time:",
+                    f"Failover: Switched from {first_execution} to {execution}\n\n"
+                    "Response time:",
+                )
+            return response, information
+        except Exception as error:
+            failures.append(f"{execution}: {error}")
+
+    raise gr.Error("All inference options failed. " + " || ".join(failures))
+
+
 def analyze_resume(
     resume_text,
     review_type,
@@ -212,27 +254,23 @@ def analyze_resume(
     max_tokens,
     temperature,
     automatic_failover,
-    execution_selection,
+    inference_mode,
+    selected_model,
     hf_token: gr.OAuthToken | None,
 ):
     """Route a review using automatic failover or one explicitly selected model."""
     if automatic_failover:
-        if execution_selection == "Local":
-            return local_resume_review(
-                resume_text, review_type, job_description, max_tokens, temperature
-            )
-        if execution_selection == "Remote":
-            return remote_resume_review(
-                resume_text,
-                review_type,
-                job_description,
-                max_tokens,
-                temperature,
-                hf_token,
-            )
-        raise gr.Error(f"Invalid inference mode: {execution_selection}")
+        return automatic_resume_review(
+            resume_text,
+            review_type,
+            job_description,
+            max_tokens,
+            temperature,
+            inference_mode,
+            hf_token,
+        )
 
-    execution = MODEL_EXECUTION.get(execution_selection)
+    execution = MODEL_EXECUTION.get(selected_model)
     if execution == "Local":
         return local_resume_review(
             resume_text,
@@ -240,7 +278,7 @@ def analyze_resume(
             job_description,
             max_tokens,
             temperature,
-            models=[execution_selection],
+            models=[selected_model],
         )
     if execution == "Remote":
         return remote_resume_review(
@@ -250,19 +288,16 @@ def analyze_resume(
             max_tokens,
             temperature,
             hf_token,
-            models=[execution_selection],
+            models=[selected_model],
         )
-    raise gr.Error(f"Invalid model: {execution_selection}")
+    raise gr.Error(f"Invalid model: {selected_model}")
 
 
-def execution_choices(automatic_failover):
-    """Swap one selector between failover chains and individual models."""
-    if automatic_failover:
-        return gr.Dropdown(choices=FAILOVER_CHOICES, value="Remote", label="Execution")
-    return gr.Dropdown(
-        choices=MODEL_CHOICES,
-        value=REMOTE_PRIMARY_MODEL,
-        label="Execution",
+def execution_control_visibility(automatic_failover):
+    """Show the mode toggle for failover or the model picker for direct use."""
+    return (
+        gr.Radio(visible=automatic_failover),
+        gr.Dropdown(visible=not automatic_failover),
     )
 
 
@@ -276,12 +311,18 @@ with gr.Blocks(title="ResumeLens AI") as demo:
             automatic_failover = gr.Checkbox(
                 value=True,
                 label="Automatic failover",
-                info="Try the backup model if the primary model fails.",
+                info="Try all four models, starting with the selected execution.",
             )
-            execution_selection = gr.Dropdown(
-                choices=FAILOVER_CHOICES,
+            inference_mode = gr.Radio(
+                choices=["Local", "Remote"],
                 value="Remote",
-                label="Execution",
+                label="Start with",
+            )
+            selected_model = gr.Dropdown(
+                choices=MODEL_CHOICES,
+                value=REMOTE_PRIMARY_MODEL,
+                label="Model",
+                visible=False,
             )
             max_tokens = gr.Slider(
                 minimum=256,
@@ -341,14 +382,15 @@ ZeroGPU or a remotely hosted model through the Hugging Face Inference API.
             max_tokens,
             temperature,
             automatic_failover,
-            execution_selection,
+            inference_mode,
+            selected_model,
         ],
         outputs=[feedback, model_information],
     )
     automatic_failover.change(
-        fn=execution_choices,
+        fn=execution_control_visibility,
         inputs=automatic_failover,
-        outputs=execution_selection,
+        outputs=[inference_mode, selected_model],
     )
 
 demo.queue()
