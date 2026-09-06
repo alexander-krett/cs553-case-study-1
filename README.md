@@ -5,8 +5,8 @@ description. It supports two inference modes with automatic failover:
 
 - **Local** runs `Qwen/Qwen3.5-4B` on Hugging Face ZeroGPU and falls back to
   `ibm-granite/granite-4.2-3b`.
-- **Remote** uses `zai-org/GLM-5.3-Flash` through the Hugging Face Inference API
-  and falls back to `openai/gpt-oss-20b`.
+- **Remote** uses `openai/gpt-oss-20b` through the Hugging Face Inference API
+  and falls back to `zai-org/GLM-5.3-Flash`.
 
 Use synthetic or sanitized resumes only. Choose an inference mode, paste a
 resume, select a review type, and click **Analyze Resume**. Remote inference
@@ -15,8 +15,9 @@ enabled by default. Disable it to select any of the four models directly.
 
 The default model IDs can be changed with `LOCAL_PRIMARY_MODEL`,
 `LOCAL_BACKUP_MODEL`, `REMOTE_PRIMARY_MODEL`, and `REMOTE_BACKUP_MODEL`.
-Generation controls and the Local/Remote failover mode are under **Advanced
-settings**. Every model uses the same response-token budget.
+The unified **Execution** selector shows Local/Remote chains when failover is on
+and individual models when it is off. Generation controls are under **Advanced
+settings**, and every model uses the same response-token budget.
 
 The app is deployed at [akrett/cs553-ml-ops](https://huggingface.co/spaces/akrett/cs553-ml-ops).
 

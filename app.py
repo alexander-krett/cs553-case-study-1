@@ -14,8 +14,8 @@ from src.prompts import REVIEW_TYPES, SYSTEM_PROMPT, build_prompt
 
 LOCAL_PRIMARY_MODEL = os.getenv("LOCAL_PRIMARY_MODEL", "Qwen/Qwen3.5-4B")
 LOCAL_BACKUP_MODEL = os.getenv("LOCAL_BACKUP_MODEL", "ibm-granite/granite-4.2-3b")
-REMOTE_PRIMARY_MODEL = os.getenv("REMOTE_PRIMARY_MODEL", "zai-org/GLM-5.3-Flash")
-REMOTE_BACKUP_MODEL = os.getenv("REMOTE_BACKUP_MODEL", "openai/gpt-oss-20b")
+REMOTE_PRIMARY_MODEL = os.getenv("REMOTE_PRIMARY_MODEL", "openai/gpt-oss-20b")
+REMOTE_BACKUP_MODEL = os.getenv("REMOTE_BACKUP_MODEL", "zai-org/GLM-5.3-Flash")
 
 MODEL_EXECUTION = {
     LOCAL_PRIMARY_MODEL: "Local",
@@ -23,8 +23,16 @@ MODEL_EXECUTION = {
     REMOTE_PRIMARY_MODEL: "Remote",
     REMOTE_BACKUP_MODEL: "Remote",
 }
-MODEL_CHOICES = list(MODEL_EXECUTION)
-INFERENCE_MODES = ["Local", "Remote"]
+FAILOVER_CHOICES = [
+    ("Remote — GPT-OSS 20B → GLM 5.3 Flash", "Remote"),
+    ("Local — Qwen 3.5 4B → Granite 4.2 3B", "Local"),
+]
+MODEL_CHOICES = [
+    ("Remote — GPT-OSS 20B", REMOTE_PRIMARY_MODEL),
+    ("Remote — GLM 5.3 Flash", REMOTE_BACKUP_MODEL),
+    ("Local — Qwen 3.5 4B", LOCAL_PRIMARY_MODEL),
+    ("Local — Granite 4.2 3B", LOCAL_BACKUP_MODEL),
+]
 
 
 @lru_cache(maxsize=2)
@@ -137,9 +145,9 @@ def local_resume_review(
 
 def _remote_extra_body(model_id):
     if model_id == REMOTE_PRIMARY_MODEL:
-        return {"reasoning_effort": "low", "clear_thinking": True}
-    if model_id == REMOTE_BACKUP_MODEL:
         return {"reasoning_effort": "low"}
+    if model_id == REMOTE_BACKUP_MODEL:
+        return {"reasoning_effort": "low", "clear_thinking": True}
     return None
 
 
@@ -203,18 +211,17 @@ def analyze_resume(
     job_description,
     max_tokens,
     temperature,
-    inference_mode,
     automatic_failover,
-    selected_model,
+    execution_selection,
     hf_token: gr.OAuthToken | None,
 ):
     """Route a review using automatic failover or one explicitly selected model."""
     if automatic_failover:
-        if inference_mode == "Local":
+        if execution_selection == "Local":
             return local_resume_review(
                 resume_text, review_type, job_description, max_tokens, temperature
             )
-        if inference_mode == "Remote":
+        if execution_selection == "Remote":
             return remote_resume_review(
                 resume_text,
                 review_type,
@@ -223,9 +230,9 @@ def analyze_resume(
                 temperature,
                 hf_token,
             )
-        raise gr.Error(f"Invalid inference mode: {inference_mode}")
+        raise gr.Error(f"Invalid inference mode: {execution_selection}")
 
-    execution = MODEL_EXECUTION.get(selected_model)
+    execution = MODEL_EXECUTION.get(execution_selection)
     if execution == "Local":
         return local_resume_review(
             resume_text,
@@ -233,7 +240,7 @@ def analyze_resume(
             job_description,
             max_tokens,
             temperature,
-            models=[selected_model],
+            models=[execution_selection],
         )
     if execution == "Remote":
         return remote_resume_review(
@@ -243,13 +250,20 @@ def analyze_resume(
             max_tokens,
             temperature,
             hf_token,
-            models=[selected_model],
+            models=[execution_selection],
         )
-    raise gr.Error(f"Invalid model: {selected_model}")
+    raise gr.Error(f"Invalid model: {execution_selection}")
 
 
-def model_selector_visibility(automatic_failover):
-    return gr.Dropdown(visible=not automatic_failover)
+def execution_choices(automatic_failover):
+    """Swap one selector between failover chains and individual models."""
+    if automatic_failover:
+        return gr.Dropdown(choices=FAILOVER_CHOICES, value="Remote", label="Execution")
+    return gr.Dropdown(
+        choices=MODEL_CHOICES,
+        value=REMOTE_PRIMARY_MODEL,
+        label="Execution",
+    )
 
 
 with gr.Blocks(title="ResumeLens AI") as demo:
@@ -260,19 +274,15 @@ with gr.Blocks(title="ResumeLens AI") as demo:
             label="Automatic failover",
             info="Try the backup model if the primary model fails.",
         )
-        selected_model = gr.Dropdown(
-            choices=MODEL_CHOICES,
-            value=REMOTE_PRIMARY_MODEL,
-            label="Model",
-            visible=False,
+        execution_selection = gr.Dropdown(
+            choices=FAILOVER_CHOICES,
+            value="Remote",
+            label="Execution",
         )
         gr.Markdown("Sign in before using Remote inference.")
         gr.LoginButton()
 
         with gr.Accordion("Advanced settings", open=False):
-            inference_mode = gr.Radio(
-                choices=INFERENCE_MODES, value="Remote", label="Failover execution"
-            )
             max_tokens = gr.Slider(
                 minimum=256,
                 maximum=2048,
@@ -330,16 +340,15 @@ ZeroGPU or a remotely hosted model through the Hugging Face Inference API.
             job_description,
             max_tokens,
             temperature,
-            inference_mode,
             automatic_failover,
-            selected_model,
+            execution_selection,
         ],
         outputs=[feedback, model_information],
     )
     automatic_failover.change(
-        fn=model_selector_visibility,
+        fn=execution_choices,
         inputs=automatic_failover,
-        outputs=selected_model,
+        outputs=execution_selection,
     )
 
 demo.queue()

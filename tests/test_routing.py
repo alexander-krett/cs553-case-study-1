@@ -17,7 +17,7 @@ def test_local_mode_routes_with_automatic_failover(monkeypatch):
     monkeypatch.setattr(app, "local_resume_review", local)
     monkeypatch.setattr(app, "remote_resume_review", remote)
 
-    result = app.analyze_resume(*COMMON_ARGS, "Local", True, app.REMOTE_PRIMARY_MODEL, None)
+    result = app.analyze_resume(*COMMON_ARGS, True, "Local", None)
 
     assert result == ("local feedback", "local info")
     local.assert_called_once_with(*COMMON_ARGS)
@@ -29,9 +29,7 @@ def test_remote_mode_routes_with_automatic_failover(monkeypatch):
     remote = Mock(return_value=("remote feedback", "remote info"))
     monkeypatch.setattr(app, "remote_resume_review", remote)
 
-    result = app.analyze_resume(
-        *COMMON_ARGS, "Remote", True, app.REMOTE_PRIMARY_MODEL, token
-    )
+    result = app.analyze_resume(*COMMON_ARGS, True, "Remote", token)
 
     assert result == ("remote feedback", "remote info")
     remote.assert_called_once_with(*COMMON_ARGS, token)
@@ -41,9 +39,7 @@ def test_manual_model_selection_bypasses_failover(monkeypatch):
     local = Mock(return_value=("feedback", "info"))
     monkeypatch.setattr(app, "local_resume_review", local)
 
-    result = app.analyze_resume(
-        *COMMON_ARGS, "Remote", False, app.LOCAL_BACKUP_MODEL, None
-    )
+    result = app.analyze_resume(*COMMON_ARGS, False, app.LOCAL_BACKUP_MODEL, None)
 
     assert result == ("feedback", "info")
     local.assert_called_once_with(*COMMON_ARGS, models=[app.LOCAL_BACKUP_MODEL])
@@ -102,9 +98,12 @@ def test_remote_mode_requires_oauth(monkeypatch):
     [
         (
             app.REMOTE_PRIMARY_MODEL,
+            {"reasoning_effort": "low"},
+        ),
+        (
+            app.REMOTE_BACKUP_MODEL,
             {"reasoning_effort": "low", "clear_thinking": True},
         ),
-        (app.REMOTE_BACKUP_MODEL, {"reasoning_effort": "low"}),
     ],
 )
 def test_remote_models_use_low_reasoning_effort(monkeypatch, model_id, expected):
@@ -142,16 +141,26 @@ def test_empty_remote_response_can_trigger_failover(monkeypatch):
     assert "Backup model used" in result[1]
 
 
-def test_model_selector_visibility():
-    assert app.model_selector_visibility(True).get_config()["visible"] is False
-    assert app.model_selector_visibility(False).get_config()["visible"] is True
+def test_execution_choices_follow_failover_setting():
+    failover = app.execution_choices(True).get_config()
+    manual = app.execution_choices(False).get_config()
+
+    assert failover["value"] == "Remote"
+    assert [choice[1] for choice in failover["choices"]] == ["Remote", "Local"]
+    assert manual["value"] == app.REMOTE_PRIMARY_MODEL
+    assert [choice[1] for choice in manual["choices"]] == [
+        app.REMOTE_PRIMARY_MODEL,
+        app.REMOTE_BACKUP_MODEL,
+        app.LOCAL_PRIMARY_MODEL,
+        app.LOCAL_BACKUP_MODEL,
+    ]
 
 
 def test_invalid_mode_is_rejected():
     with pytest.raises(app.gr.Error, match="Invalid inference mode"):
-        app.analyze_resume(*COMMON_ARGS, "Other", True, app.REMOTE_PRIMARY_MODEL, None)
+        app.analyze_resume(*COMMON_ARGS, True, "Other", None)
 
 
 def test_invalid_manual_model_is_rejected():
     with pytest.raises(app.gr.Error, match="Invalid model"):
-        app.analyze_resume(*COMMON_ARGS, "Remote", False, "unknown/model", None)
+        app.analyze_resume(*COMMON_ARGS, False, "unknown/model", None)
