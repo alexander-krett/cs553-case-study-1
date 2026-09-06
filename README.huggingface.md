@@ -23,9 +23,9 @@ modes and automatic failover:
 Choose the inference mode in the sidebar, paste a synthetic or sanitized resume,
 select a review type, and click **Analyze Resume**. Remote inference requires a
 Hugging Face sign-in; Local inference does not. Automatic failover is enabled by
-default. The unified **Execution** selector shows Local/Remote chains when it is
-on and individual models when it is off. Shared generation controls are under
-Advanced settings.
+default. Under **Advanced settings**, the unified **Execution** selector shows
+Local/Remote chains when failover is on and individual models when it is off.
+The shared generation controls are there as well.
 
 Override the defaults with `LOCAL_PRIMARY_MODEL`, `LOCAL_BACKUP_MODEL`,
 `REMOTE_PRIMARY_MODEL`, and `REMOTE_BACKUP_MODEL`.

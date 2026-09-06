@@ -15,9 +15,10 @@ enabled by default. Disable it to select any of the four models directly.
 
 The default model IDs can be changed with `LOCAL_PRIMARY_MODEL`,
 `LOCAL_BACKUP_MODEL`, `REMOTE_PRIMARY_MODEL`, and `REMOTE_BACKUP_MODEL`.
-The unified **Execution** selector shows Local/Remote chains when failover is on
-and individual models when it is off. Generation controls are under **Advanced
-settings**, and every model uses the same response-token budget.
+Under **Advanced settings**, the unified **Execution** selector shows
+Local/Remote chains when failover is on and individual models when it is off.
+The shared generation controls are there as well, and every model uses the same
+response-token budget.
 
 The app is deployed at [akrett/cs553-ml-ops](https://huggingface.co/spaces/akrett/cs553-ml-ops).
 

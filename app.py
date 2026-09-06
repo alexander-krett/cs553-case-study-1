@@ -269,20 +269,20 @@ def execution_choices(automatic_failover):
 with gr.Blocks(title="ResumeLens AI") as demo:
     with gr.Sidebar():
         gr.Markdown("## Inference")
-        automatic_failover = gr.Checkbox(
-            value=True,
-            label="Automatic failover",
-            info="Try the backup model if the primary model fails.",
-        )
-        execution_selection = gr.Dropdown(
-            choices=FAILOVER_CHOICES,
-            value="Remote",
-            label="Execution",
-        )
         gr.Markdown("Sign in before using Remote inference.")
         gr.LoginButton()
 
         with gr.Accordion("Advanced settings", open=False):
+            automatic_failover = gr.Checkbox(
+                value=True,
+                label="Automatic failover",
+                info="Try the backup model if the primary model fails.",
+            )
+            execution_selection = gr.Dropdown(
+                choices=FAILOVER_CHOICES,
+                value="Remote",
+                label="Execution",
+            )
             max_tokens = gr.Slider(
                 minimum=256,
                 maximum=2048,
