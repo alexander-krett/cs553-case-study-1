@@ -13,15 +13,21 @@ hf_oauth_scopes:
 ---
 
 ResumeLens AI reviews resumes using a single Gradio interface with two inference
-modes:
+modes and automatic failover:
 
-- **Local** runs `Qwen/Qwen3-4B-Instruct-2507` on Hugging Face ZeroGPU.
-- **Remote** uses `openai/gpt-oss-20b` through the Hugging Face Inference API.
+- **Local** runs `Qwen/Qwen3.5-4B` on Hugging Face ZeroGPU and falls back to
+  `ibm-granite/granite-4.2-3b`.
+- **Remote** uses `zai-org/GLM-5.3-Flash` through the Hugging Face Inference API
+  and falls back to `openai/gpt-oss-20b`.
 
 Choose the inference mode in the sidebar, paste a synthetic or sanitized resume,
 select a review type, and click **Analyze Resume**. Remote inference requires a
-Hugging Face sign-in; Local inference does not. Set the `REMOTE_MODEL` environment
-variable to use a different remote model.
+Hugging Face sign-in; Local inference does not. Automatic failover is enabled by
+default; disable it to select any model directly. Advanced settings contain the
+Local/Remote failover mode and shared generation controls.
+
+Override the defaults with `LOCAL_PRIMARY_MODEL`, `LOCAL_BACKUP_MODEL`,
+`REMOTE_PRIMARY_MODEL`, and `REMOTE_BACKUP_MODEL`.
 
 The root `app.py` is the deployment entrypoint, and `src/prompts.py` contains
 prompt construction and input validation shared by both inference modes.
