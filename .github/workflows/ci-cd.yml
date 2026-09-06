@@ -1,4 +1,4 @@
-name: Deploy and notify Discord
+name: CI/CD
 
 on:
   push:
@@ -14,19 +14,18 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  deploy:
+  test:
+    name: Test
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-          cache: 'pip'
+          cache: pip
           cache-dependency-path: requirements-dev.txt
 
       - name: Install test dependencies
@@ -35,26 +34,56 @@ jobs:
           python -m pip install -r requirements-dev.txt
 
       - name: Run pytests
-        id: pytest
-        run: |
-          python -m pytest -v tests/
+        run: python -m pytest -v tests/
 
-      - name: Push main to Hugging Face Space
+  deploy:
+    name: Deploy
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Stage Hugging Face Space files
+        run: |
+          STAGING_DIR="${RUNNER_TEMP}/huggingface-space"
+          mkdir -p "$STAGING_DIR"
+          rsync -a --delete \
+            --exclude '.git/' \
+            --exclude '.github/' \
+            --exclude 'README.md' \
+            --exclude 'README.huggingface.md' \
+            ./ "$STAGING_DIR/"
+          cp README.huggingface.md "$STAGING_DIR/README.md"
+
+      - name: Sync to Hugging Face Space
+        uses: huggingface/hub-sync@v0.3.0
         env:
           HF_TOKEN: ${{ secrets.HF_TOKEN }}
-        run: |
-          git push --force \
-            "https://akrett:${HF_TOKEN}@huggingface.co/spaces/akrett/cs553-ml-ops.git" \
-            HEAD:main
+        with:
+          github_repo_id: ${{ github.repository }}
+          huggingface_repo_id: akrett/cs553-ml-ops
+          hf_token: ${{ secrets.HF_TOKEN }}
+          subdirectory: ${{ runner.temp }}/huggingface-space
+
+  notify:
+    name: Notify
+    if: ${{ always() }}
+    needs:
+      - test
+      - deploy
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
 
       - name: Notify Discord
-        if: always()
         env:
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
           RUN_NUMBER: ${{ github.run_number }}
-          JOB_STATUS: ${{ job.status }}
-          PYTEST_OUTCOME: ${{ steps.pytest.outcome }}
+          TEST_RESULT: ${{ needs.test.result }}
+          DEPLOY_RESULT: ${{ needs.deploy.result }}
           SERVER_URL: ${{ github.server_url }}
           REPO: ${{ github.repository }}
           BRANCH: ${{ github.ref_name }}
@@ -72,7 +101,7 @@ jobs:
           SPACE_URL="https://huggingface.co/spaces/akrett/cs553-ml-ops"
           TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
-          if [ "$JOB_STATUS" = "success" ]; then
+          if [ "$TEST_RESULT" = "success" ] && [ "$DEPLOY_RESULT" = "success" ]; then
             TITLE="🚀 CI/CD Pipeline Succeeded"
             DESC="All tests passed and code was synced to Hugging Face Spaces. The Space rebuild was triggered; application readiness has not been checked."
             COLOR=3066993
@@ -80,18 +109,34 @@ jobs:
             DEPLOY_VAL="✅ Code synced; Space rebuild triggered"
           else
             TITLE="❌ CI/CD Pipeline Failed"
-            DESC="The CI/CD pipeline encountered a failure. Deployment to Hugging Face Spaces was aborted."
             COLOR=15158332
-            if [ "$PYTEST_OUTCOME" = "success" ]; then
-              TEST_VAL="✅ Tests passed"
-              DEPLOY_VAL="❌ Deployment step failed"
-            elif [ "$PYTEST_OUTCOME" = "failure" ]; then
-              TEST_VAL="❌ Pytests failed"
-              DEPLOY_VAL="⚠️ Skipped (tests failed)"
-            else
-              TEST_VAL="⚠️ Setup/Dependency failure"
-              DEPLOY_VAL="⚠️ Skipped"
-            fi
+
+            case "$TEST_RESULT" in
+              failure)
+                TEST_VAL="❌ Tests failed"
+                DEPLOY_VAL="⚠️ Skipped (tests failed)"
+                DESC="Tests failed, so deployment to Hugging Face Spaces was not attempted."
+                ;;
+              success)
+                TEST_VAL="✅ Tests passed"
+                case "$DEPLOY_RESULT" in
+                  failure) DEPLOY_VAL="❌ Deployment failed" ;;
+                  cancelled) DEPLOY_VAL="⚠️ Deployment cancelled" ;;
+                  *) DEPLOY_VAL="⚠️ Deployment skipped" ;;
+                esac
+                DESC="Tests passed, but deployment to Hugging Face Spaces did not complete successfully."
+                ;;
+              cancelled)
+                TEST_VAL="⚠️ Tests cancelled"
+                DEPLOY_VAL="⚠️ Skipped (tests did not complete)"
+                DESC="Testing was cancelled, so deployment to Hugging Face Spaces was not attempted."
+                ;;
+              *)
+                TEST_VAL="⚠️ Tests skipped"
+                DEPLOY_VAL="⚠️ Skipped (tests did not complete)"
+                DESC="Testing did not complete, so deployment to Hugging Face Spaces was not attempted."
+                ;;
+            esac
           fi
 
           jq -n \
