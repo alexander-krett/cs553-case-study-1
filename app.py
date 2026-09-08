@@ -12,8 +12,8 @@ from src.examples import EXAMPLES
 from src.prompts import REVIEW_TYPES, SYSTEM_PROMPT, build_prompt
 
 
-LOCAL_PRIMARY_MODEL = os.getenv("LOCAL_PRIMARY_MODEL", "Qwen/Qwen3.5-4B")
-LOCAL_BACKUP_MODEL = os.getenv("LOCAL_BACKUP_MODEL", "ibm-granite/granite-4.2-3b")
+LOCAL_PRIMARY_MODEL = os.getenv("LOCAL_PRIMARY_MODEL", "ibm-granite/granite-4.2-3b")
+LOCAL_BACKUP_MODEL = os.getenv("LOCAL_BACKUP_MODEL", "Qwen/Qwen3.5-0.8B")
 REMOTE_PRIMARY_MODEL = os.getenv("REMOTE_PRIMARY_MODEL", "openai/gpt-oss-20b")
 REMOTE_BACKUP_MODEL = os.getenv("REMOTE_BACKUP_MODEL", "zai-org/GLM-5.3-Flash")
 
@@ -26,8 +26,8 @@ MODEL_EXECUTION = {
 MODEL_CHOICES = [
     ("Remote — GPT-OSS 20B", REMOTE_PRIMARY_MODEL),
     ("Remote — GLM 5.3 Flash", REMOTE_BACKUP_MODEL),
-    ("Local — Qwen 3.5 4B", LOCAL_PRIMARY_MODEL),
-    ("Local — Granite 4.2 3B", LOCAL_BACKUP_MODEL),
+    ("Local — Granite 4.2 3B", LOCAL_PRIMARY_MODEL),
+    ("Local — Qwen 3.5 0.8B", LOCAL_BACKUP_MODEL),
 ]
 
 
@@ -37,7 +37,7 @@ def get_local_pipeline(model_id):
     import torch
     from transformers import pipeline
 
-    task = "image-text-to-text" if model_id == LOCAL_PRIMARY_MODEL else "text-generation"
+    task = "image-text-to-text" if model_id == LOCAL_BACKUP_MODEL else "text-generation"
     return pipeline(
         task=task,
         model=model_id,
@@ -93,7 +93,7 @@ def _run_local_model(model_id, prompt, max_tokens, temperature):
         enable_thinking=False,
     )
     settings = _generation_settings(max_tokens, temperature)
-    if model_id == LOCAL_PRIMARY_MODEL:
+    if model_id == LOCAL_BACKUP_MODEL:
         result = local_pipeline(text=formatted_prompt, **settings)
     else:
         result = local_pipeline(formatted_prompt, **settings)

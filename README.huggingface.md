@@ -15,8 +15,8 @@ hf_oauth_scopes:
 ResumeLens AI reviews resumes using a single Gradio interface with two inference
 modes and automatic failover:
 
-- **Local-first** tries `Qwen/Qwen3.5-4B` and
-  `ibm-granite/granite-4.2-3b` on Hugging Face ZeroGPU, then crosses to the
+- **Local-first** tries `ibm-granite/granite-4.2-3b` and
+  `Qwen/Qwen3.5-0.8B` on Hugging Face ZeroGPU, then crosses to the
   remote models if both fail.
 - **Remote** uses `openai/gpt-oss-20b` through the Hugging Face Inference API
   and falls back to `zai-org/GLM-5.3-Flash`, then crosses to the local models
