@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import json
 import time
 from pathlib import Path
 
@@ -17,6 +18,9 @@ load_dotenv(Path(__file__).resolve().parent / ".env")
 INFERENCE_TIMEOUT = float(os.getenv("INFERENCE_TIMEOUT", "300"))
 LOCAL_BASE_URL = os.getenv("LOCAL_BASE_URL", "http://127.0.0.1:8080").rstrip("/")
 LOCAL_CONTEXT_SIZE = int(os.getenv("LOCAL_CONTEXT_SIZE", "4096"))
+RESOURCE_STATUS_FILE = Path(os.getenv(
+    "RESUMELENS_STATUS_PATH", "/run/resumelens-monitor/status.json"
+))
 
 
 def require_hf_token():
@@ -290,6 +294,27 @@ def execution_control_visibility(automatic_failover):
     )
 
 
+def resource_capacity_status():
+    """Show current VM resources and a warning while the monitor reports overload."""
+    try:
+        status = json.loads(RESOURCE_STATUS_FILE.read_text())
+        age = time.time() - float(status["timestamp"])
+        cpu = float(status["cpu_percent"])
+        memory = float(status["memory_percent"])
+        if age < 0 or age > 6 or not 0 <= cpu <= 100 or not 0 <= memory <= 100:
+            raise ValueError("stale or invalid monitor status")
+    except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+        return "⚠️ **Resource monitoring unavailable** — ResumeLens is still accepting reviews."
+
+    measurements = f"CPU **{cpu:.0f}%** · Memory **{memory:.0f}%**"
+    if status.get("overloaded"):
+        return (
+            f"🟠 **Near capacity** — {measurements}. "
+            "New reviews remain available; responses may take longer."
+        )
+    return f"🟢 **Operating normally** — {measurements}."
+
+
 with gr.Blocks(title="ResumeLens AI") as demo:
     with gr.Sidebar():
         gr.Markdown("## Inference")
@@ -335,6 +360,15 @@ hosted model through the Hugging Face Inference API.
 
 **For this class demonstration, use a synthetic or sanitized resume whenever possible.**
 """
+    )
+
+    capacity_status = gr.Markdown(resource_capacity_status())
+    capacity_timer = gr.Timer(value=2, active=True)
+    capacity_timer.tick(
+        fn=resource_capacity_status,
+        outputs=capacity_status,
+        queue=False,
+        show_progress="hidden",
     )
 
     with gr.Row():
