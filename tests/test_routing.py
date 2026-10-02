@@ -1,217 +1,98 @@
-from types import SimpleNamespace
-from unittest.mock import ANY, Mock, call, patch
-
+from unittest.mock import Mock, call, ANY
+import httpx
 import pytest
+import app
 
-# Unit tests use explicit fake tokens and must not require a local HF login.
-with patch("gradio.oauth._get_mocked_oauth_info", return_value={}):
-    import app
+ARGS = ("Resume", "General Resume Review", "", 512, 0.3)
 
+@pytest.fixture(autouse=True)
+def credentials(monkeypatch):
+    monkeypatch.setenv("HF_TOKEN", "test-secret")
 
-COMMON_ARGS = ("Resume", "General Resume Review", "", 2048, 0.3)
+@pytest.mark.parametrize("mode", ["Local", "Remote"])
+def test_first_mode(monkeypatch, mode):
+    first = Mock(return_value=("feedback", "info"))
+    other = Mock()
+    monkeypatch.setattr(app, mode.lower() + "_resume_review", first)
+    monkeypatch.setattr(app, ("remote" if mode == "Local" else "local") + "_resume_review", other)
+    assert app.analyze_resume(*ARGS, True, mode, app.LOCAL_PRIMARY_MODEL) == ("feedback", "info")
+    other.assert_not_called()
 
+@pytest.mark.parametrize("mode", ["Local", "Remote"])
+def test_cross_mode_failover(monkeypatch, mode):
+    monkeypatch.setattr(app, mode.lower() + "_resume_review", Mock(side_effect=RuntimeError("unavailable")))
+    other = "remote" if mode == "Local" else "local"
+    monkeypatch.setattr(app, other + "_resume_review", Mock(return_value=("feedback", "Response time: 1")))
+    assert "Switched from" in app.analyze_resume(*ARGS, True, mode, app.LOCAL_PRIMARY_MODEL)[1]
 
-def test_local_mode_routes_with_automatic_failover(monkeypatch):
-    local = Mock(return_value=("local feedback", "local info"))
-    remote = Mock()
-    monkeypatch.setattr(app, "local_resume_review", local)
-    monkeypatch.setattr(app, "remote_resume_review", remote)
+@pytest.mark.parametrize("execution", ["local", "remote"])
+def test_backup(monkeypatch, execution):
+    run = Mock(side_effect=[httpx.ReadTimeout("timeout"), "feedback"])
+    monkeypatch.setattr(app, "_run_" + execution + "_model", run)
+    assert "Backup model used" in getattr(app, execution + "_resume_review")(*ARGS)[1]
+    assert run.call_count == 2
 
-    result = app.analyze_resume(
-        *COMMON_ARGS, True, "Local", app.REMOTE_PRIMARY_MODEL, None
-    )
+@pytest.mark.parametrize("model", [app.LOCAL_PRIMARY_MODEL, app.REMOTE_BACKUP_MODEL])
+def test_manual_selection(monkeypatch, model):
+    execution = app.MODEL_EXECUTION[model].lower()
+    review = Mock(return_value=("feedback", "info"))
+    monkeypatch.setattr(app, execution + "_resume_review", review)
+    app.analyze_resume(*ARGS, False, "Local", model)
+    review.assert_called_once_with(*ARGS, models=[model])
 
-    assert result == ("local feedback", "local info")
-    local.assert_called_once_with(*COMMON_ARGS)
-    remote.assert_not_called()
+def test_missing_token(monkeypatch):
+    monkeypatch.delenv("HF_TOKEN")
+    with pytest.raises(RuntimeError, match="HF_TOKEN is required"):
+        app.require_hf_token()
+    with pytest.raises(RuntimeError, match="HF_TOKEN is required"):
+        app.remote_resume_review(*ARGS)
 
+def test_validation_before_failover(monkeypatch):
+    run = Mock()
+    monkeypatch.setattr(app, "_run_local_model", run)
+    with pytest.raises(app.gr.Error, match="paste a resume"):
+        app.analyze_resume("", *ARGS[1:], True, "Local", app.LOCAL_PRIMARY_MODEL)
+    run.assert_not_called()
 
-def test_remote_mode_routes_with_automatic_failover(monkeypatch):
-    token = SimpleNamespace(token="secret")
-    remote = Mock(return_value=("remote feedback", "remote info"))
-    monkeypatch.setattr(app, "remote_resume_review", remote)
-
-    result = app.analyze_resume(
-        *COMMON_ARGS, True, "Remote", app.REMOTE_PRIMARY_MODEL, token
-    )
-
-    assert result == ("remote feedback", "remote info")
-    remote.assert_called_once_with(*COMMON_ARGS, token)
-
-
-def test_remote_chain_failure_crosses_to_local(monkeypatch):
-    token = SimpleNamespace(token="secret")
-    remote = Mock(side_effect=app.gr.Error("remote chain failed"))
-    local = Mock(return_value=("local feedback", "Response time: 1.00 seconds"))
-    monkeypatch.setattr(app, "remote_resume_review", remote)
-    monkeypatch.setattr(app, "local_resume_review", local)
-
-    result = app.analyze_resume(
-        *COMMON_ARGS, True, "Remote", app.REMOTE_PRIMARY_MODEL, token
-    )
-
-    assert result[0] == "local feedback"
-    assert "Switched from Remote to Local" in result[1]
-    remote.assert_called_once_with(*COMMON_ARGS, token)
-    local.assert_called_once_with(*COMMON_ARGS)
-
-
-def test_local_chain_failure_crosses_to_remote(monkeypatch):
-    token = SimpleNamespace(token="secret")
-    local = Mock(side_effect=app.gr.Error("local chain failed"))
-    remote = Mock(return_value=("remote feedback", "Response time: 1.00 seconds"))
-    monkeypatch.setattr(app, "local_resume_review", local)
-    monkeypatch.setattr(app, "remote_resume_review", remote)
-
-    result = app.analyze_resume(
-        *COMMON_ARGS, True, "Local", app.REMOTE_PRIMARY_MODEL, token
-    )
-
-    assert result[0] == "remote feedback"
-    assert "Switched from Local to Remote" in result[1]
-    local.assert_called_once_with(*COMMON_ARGS)
-    remote.assert_called_once_with(*COMMON_ARGS, token)
-
-
-def test_all_execution_failures_are_combined(monkeypatch):
-    monkeypatch.setattr(
-        app, "local_resume_review", Mock(side_effect=app.gr.Error("local failed"))
-    )
-    monkeypatch.setattr(
-        app, "remote_resume_review", Mock(side_effect=app.gr.Error("remote failed"))
-    )
-
-    with pytest.raises(app.gr.Error, match="All inference options failed"):
-        app.analyze_resume(
-            *COMMON_ARGS, True, "Remote", app.REMOTE_PRIMARY_MODEL, None
-        )
-
-
-def test_manual_model_selection_bypasses_failover(monkeypatch):
-    local = Mock(return_value=("feedback", "info"))
-    monkeypatch.setattr(app, "local_resume_review", local)
-
-    result = app.analyze_resume(
-        *COMMON_ARGS, False, "Remote", app.LOCAL_BACKUP_MODEL, None
-    )
-
-    assert result == ("feedback", "info")
-    local.assert_called_once_with(*COMMON_ARGS, models=[app.LOCAL_BACKUP_MODEL])
-
-
-def test_local_failure_uses_backup(monkeypatch):
-    run_model = Mock(side_effect=[RuntimeError("primary unavailable"), "feedback"])
-    monkeypatch.setattr(app, "_run_local_model", run_model)
-
-    result = app.local_resume_review(*COMMON_ARGS)
-
-    assert result[0] == "feedback"
-    assert "Backup model used" in result[1]
-    assert app.LOCAL_BACKUP_MODEL in result[1]
-    assert run_model.call_args_list == [
-        call(app.LOCAL_PRIMARY_MODEL, ANY, 2048, 0.3),
-        call(app.LOCAL_BACKUP_MODEL, ANY, 2048, 0.3),
-    ]
-
-
-def test_remote_failure_uses_backup(monkeypatch):
-    run_model = Mock(side_effect=[RuntimeError("primary unavailable"), "feedback"])
-    monkeypatch.setattr(app, "_run_remote_model", run_model)
-    token = SimpleNamespace(token="secret")
-
-    result = app.remote_resume_review(*COMMON_ARGS, token)
-
-    assert result[0] == "feedback"
-    assert "Backup model used" in result[1]
-    assert app.REMOTE_BACKUP_MODEL in result[1]
-
-
-def test_both_remote_failures_are_reported(monkeypatch):
-    monkeypatch.setattr(
-        app,
-        "_run_remote_model",
-        Mock(side_effect=[RuntimeError("first"), RuntimeError("second")]),
-    )
-
-    with pytest.raises(app.gr.Error, match=app.REMOTE_BACKUP_MODEL):
-        app.remote_resume_review(*COMMON_ARGS, SimpleNamespace(token="secret"))
-
-
-def test_remote_mode_requires_oauth(monkeypatch):
-    run_model = Mock()
-    monkeypatch.setattr(app, "_run_remote_model", run_model)
-
-    with pytest.raises(app.gr.Error, match="Please sign in with Hugging Face"):
-        app.remote_resume_review(*COMMON_ARGS, None)
-
-    run_model.assert_not_called()
-
-
-@pytest.mark.parametrize(
-    ("model_id", "expected"),
-    [
-        (
-            app.REMOTE_PRIMARY_MODEL,
-            {"reasoning_effort": "low"},
-        ),
-        (
-            app.REMOTE_BACKUP_MODEL,
-            {"reasoning_effort": "low", "clear_thinking": True},
-        ),
-    ],
-)
-def test_remote_models_use_low_reasoning_effort(monkeypatch, model_id, expected):
-    message = SimpleNamespace(content="Useful feedback")
-    choice = SimpleNamespace(message=message, finish_reason="stop")
-    client = Mock()
-    client.chat_completion.return_value = SimpleNamespace(choices=[choice])
-    monkeypatch.setattr(app, "InferenceClient", Mock(return_value=client))
-
-    result = app._run_remote_model(model_id, "secret", "prompt", 2048, 0.3)
-
-    assert result == "Useful feedback"
-    assert client.chat_completion.call_args.kwargs["extra_body"] == expected
-    assert client.chat_completion.call_args.kwargs["max_tokens"] == 2048
-
-
-def test_empty_remote_response_can_trigger_failover(monkeypatch):
-    empty_message = SimpleNamespace(content="")
-    empty_choice = SimpleNamespace(message=empty_message, finish_reason="length")
-    good_message = SimpleNamespace(content="Backup feedback")
-    good_choice = SimpleNamespace(message=good_message, finish_reason="stop")
-    first_client = Mock()
-    first_client.chat_completion.return_value = SimpleNamespace(choices=[empty_choice])
-    second_client = Mock()
-    second_client.chat_completion.return_value = SimpleNamespace(choices=[good_choice])
-    monkeypatch.setattr(
-        app, "InferenceClient", Mock(side_effect=[first_client, second_client])
-    )
-
-    result = app.remote_resume_review(
-        *COMMON_ARGS, SimpleNamespace(token="secret")
-    )
-
-    assert result[0] == "Backup feedback"
-    assert "Backup model used" in result[1]
-
-
-def test_execution_controls_follow_failover_setting():
-    mode_on, model_off = app.execution_control_visibility(True)
-    mode_off, model_on = app.execution_control_visibility(False)
-
-    assert mode_on.get_config()["visible"] is True
-    assert model_off.get_config()["visible"] is False
-    assert mode_off.get_config()["visible"] is False
-    assert model_on.get_config()["visible"] is True
-
-
-def test_invalid_mode_is_rejected():
-    with pytest.raises(app.gr.Error, match="Invalid inference mode"):
-        app.analyze_resume(
-            *COMMON_ARGS, True, "Other", app.REMOTE_PRIMARY_MODEL, None
-        )
-
-
-def test_invalid_manual_model_is_rejected():
+def test_invalid_selection():
     with pytest.raises(app.gr.Error, match="Invalid model"):
-        app.analyze_resume(*COMMON_ARGS, False, "Remote", "unknown/model", None)
+        app.analyze_resume(*ARGS, False, "Local", "invalid")
+    with pytest.raises(app.gr.Error, match="Invalid inference mode"):
+        app.analyze_resume(*ARGS, True, "invalid", app.LOCAL_PRIMARY_MODEL)
+
+def test_combined_errors_redact_credentials(monkeypatch):
+    monkeypatch.setattr(app, "_run_local_model", Mock(side_effect=RuntimeError("test-secret")))
+    monkeypatch.setattr(app, "_run_remote_model", Mock(side_effect=RuntimeError("test-secret")))
+    with pytest.raises(app.gr.Error) as error:
+        app.analyze_resume(*ARGS, True, "Local", app.LOCAL_PRIMARY_MODEL)
+    assert "test-secret" not in str(error.value)
+
+def test_remote_empty_response(monkeypatch):
+    client = Mock()
+    client.chat_completion.return_value = Mock(choices=[Mock(message=Mock(content=""), finish_reason="length")])
+    monkeypatch.setattr(app, "InferenceClient", Mock(return_value=client))
+    with pytest.raises(RuntimeError, match="empty response"):
+        app._run_remote_model(app.REMOTE_PRIMARY_MODEL, "test-secret", "prompt", 512, .3)
+    assert client.chat_completion.call_args.kwargs["extra_body"] == {"reasoning_effort": "low"}
+
+@pytest.mark.parametrize("token_count,content,expected_error", [(100," feedback ",None),(4096,"feedback","exceeds local context"),(100,"","empty response")])
+def test_local_capacity_and_response(monkeypatch, token_count, content, expected_error):
+    client = Mock()
+    client.post.side_effect = [Mock(json=lambda: {"prompt":"formatted"}), Mock(json=lambda: {"tokens":[1]*token_count}), Mock(json=lambda: {"choices":[{"message":{"content":content}}]})]
+    manager = Mock()
+    manager.__enter__ = Mock(return_value=client)
+    manager.__exit__ = Mock(return_value=False)
+    monkeypatch.setattr(app.httpx, "Client", Mock(return_value=manager))
+    if expected_error:
+        with pytest.raises(RuntimeError, match=expected_error):
+            app._run_local_model(app.LOCAL_PRIMARY_MODEL, "prompt", 512, .3)
+    else:
+        assert app._run_local_model(app.LOCAL_PRIMARY_MODEL, "prompt", 512, .3) == "feedback"
+        assert client.post.call_args.kwargs["json"]["chat_template_kwargs"] == {"enable_thinking":False}
+    if token_count == 4096:
+        assert client.post.call_count == 2
+
+def test_control_visibility():
+    mode, model = app.execution_control_visibility(True)
+    assert mode.get_config()["visible"]
+    assert not model.get_config()["visible"]

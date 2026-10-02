@@ -2,18 +2,32 @@ from __future__ import annotations
 
 import os
 import time
-from functools import lru_cache
+from pathlib import Path
 
 import gradio as gr
-import spaces
+import httpx
+from dotenv import load_dotenv
 from huggingface_hub import InferenceClient
 
 from src.examples import EXAMPLES
 from src.prompts import REVIEW_TYPES, SYSTEM_PROMPT, build_prompt
 
 
-LOCAL_PRIMARY_MODEL = os.getenv("LOCAL_PRIMARY_MODEL", "ibm-granite/granite-4.2-3b")
-LOCAL_BACKUP_MODEL = os.getenv("LOCAL_BACKUP_MODEL", "Qwen/Qwen3.5-0.8B")
+load_dotenv(Path(__file__).resolve().parent / ".env")
+INFERENCE_TIMEOUT = float(os.getenv("INFERENCE_TIMEOUT", "300"))
+LOCAL_BASE_URL = os.getenv("LOCAL_BASE_URL", "http://127.0.0.1:8080").rstrip("/")
+LOCAL_CONTEXT_SIZE = int(os.getenv("LOCAL_CONTEXT_SIZE", "4096"))
+
+
+def require_hf_token():
+    token = os.getenv("HF_TOKEN", "").strip()
+    if not token:
+        raise RuntimeError("HF_TOKEN is required; deploy with a root hf-token file.")
+    return token
+
+
+LOCAL_PRIMARY_MODEL = os.getenv("LOCAL_PRIMARY_MODEL", "Qwen/Qwen3-0.6B-GGUF")
+LOCAL_BACKUP_MODEL = os.getenv("LOCAL_BACKUP_MODEL", "LiquidAI/LFM2.5-1.2B-Instruct-GGUF")
 REMOTE_PRIMARY_MODEL = os.getenv("REMOTE_PRIMARY_MODEL", "openai/gpt-oss-20b")
 REMOTE_BACKUP_MODEL = os.getenv("REMOTE_BACKUP_MODEL", "zai-org/GLM-5.3-Flash")
 
@@ -26,24 +40,9 @@ MODEL_EXECUTION = {
 MODEL_CHOICES = [
     ("Remote — GPT-OSS 20B", REMOTE_PRIMARY_MODEL),
     ("Remote — GLM 5.3 Flash", REMOTE_BACKUP_MODEL),
-    ("Local — Granite 4.2 3B", LOCAL_PRIMARY_MODEL),
-    ("Local — Qwen 3.5 0.8B", LOCAL_BACKUP_MODEL),
+    ("Local — Qwen3 0.6B", LOCAL_PRIMARY_MODEL),
+    ("Local — LFM2.5 1.2B", LOCAL_BACKUP_MODEL),
 ]
-
-
-@lru_cache(maxsize=2)
-def get_local_pipeline(model_id):
-    """Load a local model only when it is first requested."""
-    import torch
-    from transformers import pipeline
-
-    task = "image-text-to-text" if model_id == LOCAL_BACKUP_MODEL else "text-generation"
-    return pipeline(
-        task=task,
-        model=model_id,
-        device="cuda",
-        dtype=torch.bfloat16,
-    )
 
 
 def _validated_prompt(resume_text, review_type, job_description):
@@ -60,47 +59,44 @@ def _messages(prompt):
     ]
 
 
-def _generation_settings(max_tokens, temperature):
-    settings = {"max_new_tokens": int(max_tokens), "return_full_text": False}
-    if float(temperature) > 0:
-        settings.update(do_sample=True, temperature=float(temperature), top_p=0.95)
-    else:
-        settings["do_sample"] = False
-    return settings
-
-
-def _extract_generated_text(result):
-    """Normalize text and conversational pipeline response shapes."""
-    generated = result[0]["generated_text"]
-    if isinstance(generated, str):
-        return generated.strip()
-    if isinstance(generated, list) and generated:
-        content = generated[-1].get("content", "")
-        if isinstance(content, str):
-            return content.strip()
-    return ""
-
-
 def _run_local_model(model_id, prompt, max_tokens, temperature):
-    local_pipeline = get_local_pipeline(model_id)
-    template_source = getattr(local_pipeline, "tokenizer", None)
-    if template_source is None:
-        template_source = local_pipeline.processor
-    formatted_prompt = template_source.apply_chat_template(
-        _messages(prompt),
-        tokenize=False,
-        add_generation_prompt=True,
-        enable_thinking=False,
-    )
-    settings = _generation_settings(max_tokens, temperature)
-    if model_id == LOCAL_BACKUP_MODEL:
-        result = local_pipeline(text=formatted_prompt, **settings)
-    else:
-        result = local_pipeline(formatted_prompt, **settings)
-    response = _extract_generated_text(result)
-    if not response:
+    messages = _messages(prompt)
+    with httpx.Client(
+        base_url=LOCAL_BASE_URL,
+        timeout=INFERENCE_TIMEOUT,
+        limits=httpx.Limits(max_keepalive_connections=0),
+    ) as client:
+        template = client.post("/apply-template", json={
+            "model": model_id, "messages": messages,
+            "chat_template_kwargs": {"enable_thinking": False},
+        })
+        template.raise_for_status()
+        tokens = client.post("/tokenize", json={
+            "model": model_id, "content": template.json()["prompt"],
+            "add_special": True, "parse_special": True,
+        })
+        tokens.raise_for_status()
+        if len(tokens.json()["tokens"]) + int(max_tokens) > LOCAL_CONTEXT_SIZE:
+            raise RuntimeError("Input plus requested response exceeds local context; shorten input or reduce response tokens.")
+        result = client.post("/v1/chat/completions", json={
+            "model": model_id, "messages": messages,
+            "max_tokens": int(max_tokens), "temperature": float(temperature),
+            "top_p": 0.95, "stream": False,
+            "chat_template_kwargs": {"enable_thinking": False},
+            "cache_prompt": True,
+        })
+        result.raise_for_status()
+        response = result.json()["choices"][0]["message"].get("content", "")
+    if not response or not response.strip():
         raise RuntimeError("the model returned an empty response")
-    return response
+    return response.strip()
+
+
+def _safe_error(error):
+    # Provider exceptions can include request credentials or URLs.
+    token = os.getenv("HF_TOKEN", "")
+    message = str(error)
+    return message.replace(token, "[redacted]") if token else message
 
 
 def _inference_information(model_id, execution, elapsed_time, fallback=False):
@@ -116,7 +112,6 @@ Response time: {elapsed_time:.2f} seconds
 """
 
 
-@spaces.GPU(duration=45)
 def local_resume_review(
     resume_text, review_type, job_description, max_tokens, temperature, models=None
 ):
@@ -131,10 +126,10 @@ def local_resume_review(
             response = _run_local_model(model_id, prompt, max_tokens, temperature)
             elapsed_time = time.perf_counter() - start_time
             return response, _inference_information(
-                model_id, "Local Hugging Face ZeroGPU", elapsed_time, index > 0
+                model_id, "Local CPU (llama.cpp)", elapsed_time, index > 0
             )
         except Exception as error:
-            failures.append(f"{model_id}: {error}")
+            failures.append(f"{model_id}: {_safe_error(error)}")
 
     raise gr.Error("Local inference failed. " + " | ".join(failures))
 
@@ -148,7 +143,7 @@ def _remote_extra_body(model_id):
 
 
 def _run_remote_model(model_id, token, prompt, max_tokens, temperature):
-    client = InferenceClient(token=token, model=model_id)
+    client = InferenceClient(token=token, model=model_id, timeout=INFERENCE_TIMEOUT)
     request = {
         "messages": _messages(prompt),
         "max_tokens": int(max_tokens),
@@ -174,12 +169,10 @@ def remote_resume_review(
     job_description,
     max_tokens,
     temperature,
-    hf_token: gr.OAuthToken | None,
     models=None,
 ):
     """Analyze a resume remotely, optionally failing over to a backup model."""
-    if hf_token is None:
-        raise gr.Error("Please sign in with Hugging Face before using a remote model.")
+    token = require_hf_token()
 
     prompt = _validated_prompt(resume_text, review_type, job_description)
     candidates = models or [REMOTE_PRIMARY_MODEL, REMOTE_BACKUP_MODEL]
@@ -189,14 +182,14 @@ def remote_resume_review(
     for index, model_id in enumerate(candidates):
         try:
             response = _run_remote_model(
-                model_id, hf_token.token, prompt, max_tokens, temperature
+                model_id, token, prompt, max_tokens, temperature
             )
             elapsed_time = time.perf_counter() - start_time
             return response, _inference_information(
                 model_id, "Remote Hugging Face API", elapsed_time, index > 0
             )
         except Exception as error:
-            failures.append(f"{model_id}: {error}")
+            failures.append(f"{model_id}: {_safe_error(error)}")
 
     raise gr.Error("Remote inference failed. " + " | ".join(failures))
 
@@ -208,7 +201,6 @@ def automatic_resume_review(
     max_tokens,
     temperature,
     first_execution,
-    hf_token: gr.OAuthToken | None,
 ):
     """Try both models in one execution mode, then cross to the other mode."""
     if first_execution not in {"Local", "Remote"}:
@@ -225,7 +217,7 @@ def automatic_resume_review(
     )
     attempts = (
         ("Local", lambda: local_resume_review(*common_args)),
-        ("Remote", lambda: remote_resume_review(*common_args, hf_token)),
+        ("Remote", lambda: remote_resume_review(*common_args)),
     )
     if first_execution == "Remote":
         attempts = tuple(reversed(attempts))
@@ -242,7 +234,7 @@ def automatic_resume_review(
                 )
             return response, information
         except Exception as error:
-            failures.append(f"{execution}: {error}")
+            failures.append(f"{execution}: {_safe_error(error)}")
 
     raise gr.Error("All inference options failed. " + " || ".join(failures))
 
@@ -256,7 +248,6 @@ def analyze_resume(
     automatic_failover,
     inference_mode,
     selected_model,
-    hf_token: gr.OAuthToken | None,
 ):
     """Route a review using automatic failover or one explicitly selected model."""
     if automatic_failover:
@@ -267,7 +258,6 @@ def analyze_resume(
             max_tokens,
             temperature,
             inference_mode,
-            hf_token,
         )
 
     execution = MODEL_EXECUTION.get(selected_model)
@@ -287,7 +277,6 @@ def analyze_resume(
             job_description,
             max_tokens,
             temperature,
-            hf_token,
             models=[selected_model],
         )
     raise gr.Error(f"Invalid model: {selected_model}")
@@ -304,8 +293,6 @@ def execution_control_visibility(automatic_failover):
 with gr.Blocks(title="ResumeLens AI") as demo:
     with gr.Sidebar():
         gr.Markdown("## Inference")
-        gr.Markdown("Sign in before using Remote inference.")
-        gr.LoginButton()
 
         with gr.Accordion("Advanced settings", open=False):
             automatic_failover = gr.Checkbox(
@@ -315,12 +302,12 @@ with gr.Blocks(title="ResumeLens AI") as demo:
             )
             inference_mode = gr.Radio(
                 choices=["Local", "Remote"],
-                value="Remote",
+                value="Local",
                 label="Start with",
             )
             selected_model = gr.Dropdown(
                 choices=MODEL_CHOICES,
-                value=REMOTE_PRIMARY_MODEL,
+                value=LOCAL_PRIMARY_MODEL,
                 label="Model",
                 visible=False,
             )
@@ -343,8 +330,8 @@ with gr.Blocks(title="ResumeLens AI") as demo:
         """
 # ResumeLens AI
 
-Analyze a resume with either a model running locally on Hugging Face
-ZeroGPU or a remotely hosted model through the Hugging Face Inference API.
+Analyze a resume with a CPU model running on this server or a remotely
+hosted model through the Hugging Face Inference API.
 
 **For this class demonstration, use a synthetic or sanitized resume whenever possible.**
 """
@@ -393,7 +380,8 @@ ZeroGPU or a remotely hosted model through the Hugging Face Inference API.
         outputs=[inference_mode, selected_model],
     )
 
-demo.queue()
+demo.queue(default_concurrency_limit=1, max_size=8)
 
 if __name__ == "__main__":
-    demo.launch()
+    require_hf_token()
+    demo.launch(server_name="0.0.0.0", server_port=7860, share=False)

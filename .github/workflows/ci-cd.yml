@@ -1,178 +1,20 @@
-name: CI/CD
-
+name: Tests
 on:
   push:
-    branches:
-      - main
+    branches: [local-deploy-main]
+  pull_request:
+    branches: [local-deploy-main]
   workflow_dispatch:
-
 permissions:
   contents: read
-
-concurrency:
-  group: hugging-face-deploy
-  cancel-in-progress: true
-
 jobs:
   test:
-    name: Test
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
-      - name: Check out repository
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v7
         with:
-          python-version: '3.11'
-          cache: pip
-          cache-dependency-path: requirements-dev.txt
-
-      - name: Install test dependencies
-        run: |
-          python -m pip install --upgrade pip
-          python -m pip install -r requirements-dev.txt
-
-      - name: Run pytests
-        run: python -m pytest -v tests/
-
-  deploy:
-    name: Deploy
-    needs: test
-    runs-on: ubuntu-latest
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@v4
-
-      - name: Stage Hugging Face Space files
-        run: |
-          STAGING_DIR="${RUNNER_TEMP}/huggingface-space"
-          mkdir -p "$STAGING_DIR"
-          rsync -a --delete \
-            --exclude '.git/' \
-            --exclude '.github/' \
-            --exclude 'README.md' \
-            --exclude 'README.huggingface.md' \
-            ./ "$STAGING_DIR/"
-          cp README.huggingface.md "$STAGING_DIR/README.md"
-
-      - name: Sync to Hugging Face Space
-        uses: huggingface/hub-sync@v0.3.0
-        env:
-          HF_TOKEN: ${{ secrets.HF_TOKEN }}
-        with:
-          github_repo_id: ${{ github.repository }}
-          huggingface_repo_id: akrett/cs553-ml-ops
-          hf_token: ${{ secrets.HF_TOKEN }}
-          subdirectory: ${{ runner.temp }}/huggingface-space
-
-  notify:
-    name: Notify
-    if: ${{ always() }}
-    needs:
-      - test
-      - deploy
-    runs-on: ubuntu-latest
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@v4
-
-      - name: Notify Discord
-        env:
-          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
-          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-          RUN_NUMBER: ${{ github.run_number }}
-          TEST_RESULT: ${{ needs.test.result }}
-          DEPLOY_RESULT: ${{ needs.deploy.result }}
-          SERVER_URL: ${{ github.server_url }}
-          REPO: ${{ github.repository }}
-          BRANCH: ${{ github.ref_name }}
-          EVENT_NAME: ${{ github.event_name }}
-          ACTOR: ${{ github.actor }}
-        run: |
-          if [ -z "$DISCORD_WEBHOOK" ]; then
-            echo "DISCORD_WEBHOOK is not set; skipping Discord notification."
-            exit 0
-          fi
-
-          COMMIT_MSG=$(git log -1 --pretty=format:'%s')
-          SHORT_SHA=$(git rev-parse --short HEAD)
-          COMMIT_URL="${SERVER_URL}/${REPO}/commit/${SHORT_SHA}"
-          SPACE_URL="https://huggingface.co/spaces/akrett/cs553-ml-ops"
-          TIMESTAMP=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-
-          if [ "$TEST_RESULT" = "success" ] && [ "$DEPLOY_RESULT" = "success" ]; then
-            TITLE="🚀 CI/CD Pipeline Succeeded"
-            DESC="All tests passed and code was synced to Hugging Face Spaces. The Space rebuild was triggered; application readiness has not been checked."
-            COLOR=3066993
-            TEST_VAL="✅ All tests passed"
-            DEPLOY_VAL="✅ Code synced; Space rebuild triggered"
-          else
-            TITLE="❌ CI/CD Pipeline Failed"
-            COLOR=15158332
-
-            case "$TEST_RESULT" in
-              failure)
-                TEST_VAL="❌ Tests failed"
-                DEPLOY_VAL="⚠️ Skipped (tests failed)"
-                DESC="Tests failed, so deployment to Hugging Face Spaces was not attempted."
-                ;;
-              success)
-                TEST_VAL="✅ Tests passed"
-                case "$DEPLOY_RESULT" in
-                  failure) DEPLOY_VAL="❌ Deployment failed" ;;
-                  cancelled) DEPLOY_VAL="⚠️ Deployment cancelled" ;;
-                  *) DEPLOY_VAL="⚠️ Deployment skipped" ;;
-                esac
-                DESC="Tests passed, but deployment to Hugging Face Spaces did not complete successfully."
-                ;;
-              cancelled)
-                TEST_VAL="⚠️ Tests cancelled"
-                DEPLOY_VAL="⚠️ Skipped (tests did not complete)"
-                DESC="Testing was cancelled, so deployment to Hugging Face Spaces was not attempted."
-                ;;
-              *)
-                TEST_VAL="⚠️ Tests skipped"
-                DEPLOY_VAL="⚠️ Skipped (tests did not complete)"
-                DESC="Testing did not complete, so deployment to Hugging Face Spaces was not attempted."
-                ;;
-            esac
-          fi
-
-          jq -n \
-            --arg title "$TITLE" \
-            --arg desc "$DESC" \
-            --argjson color "$COLOR" \
-            --arg commit "[\`${SHORT_SHA}\`](${COMMIT_URL}) - ${COMMIT_MSG}" \
-            --arg author "$ACTOR" \
-            --arg branch "${BRANCH} (${EVENT_NAME})" \
-            --arg tests "$TEST_VAL" \
-            --arg deploy "$DEPLOY_VAL" \
-            --arg space "[akrett/cs553-ml-ops](${SPACE_URL})" \
-            --arg run "[Run #${RUN_NUMBER}](${RUN_URL})" \
-            --arg timestamp "$TIMESTAMP" \
-            '{
-              embeds: [
-                {
-                  title: $title,
-                  description: $desc,
-                  color: $color,
-                  fields: [
-                    {name: "Commit", value: $commit, inline: false},
-                    {name: "Author", value: $author, inline: true},
-                    {name: "Branch / Event", value: $branch, inline: true},
-                    {name: "Tests", value: $tests, inline: true},
-                    {name: "Deployment", value: $deploy, inline: true},
-                    {name: "Hugging Face Space", value: $space, inline: true},
-                    {name: "Workflow Run", value: $run, inline: true}
-                  ],
-                  footer: {text: "GitHub Actions CI/CD • CS553 Case Study 1"},
-                  timestamp: $timestamp
-                }
-              ]
-            }' > discord-payload.json
-
-          curl --fail-with-body --silent --show-error \
-            -H "Content-Type: application/json" \
-            --data @discord-payload.json \
-            "${DISCORD_WEBHOOK}"
+          version: "0.11.16"
+          enable-cache: true
+      - run: uv sync --locked
+      - run: uv run --locked python -m pytest -q

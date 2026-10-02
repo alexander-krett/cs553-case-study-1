@@ -31,3 +31,7 @@ models/
 .idea/
 .vscode/
 .DS_Store
+
+# Deployment token and runtime
+hf-token
+.runtime/
