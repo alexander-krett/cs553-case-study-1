@@ -362,15 +362,6 @@ hosted model through the Hugging Face Inference API.
 """
     )
 
-    capacity_status = gr.Markdown(resource_capacity_status())
-    capacity_timer = gr.Timer(value=2, active=True)
-    capacity_timer.tick(
-        fn=resource_capacity_status,
-        outputs=capacity_status,
-        queue=False,
-        show_progress="hidden",
-    )
-
     with gr.Row():
         with gr.Column():
             resume_text = gr.Textbox(
