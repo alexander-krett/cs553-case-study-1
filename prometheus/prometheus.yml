@@ -1,0 +1,28 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: resumelens_api_product
+    static_configs:
+      - targets: ["api_product:8000"]
+        labels:
+          deployment: api
+
+  - job_name: resumelens_api_node
+    static_configs:
+      - targets: ["api_product:9100"]
+        labels:
+          deployment: api
+
+  - job_name: resumelens_local_product
+    static_configs:
+      - targets: ["local_product:8000"]
+        labels:
+          deployment: local
+
+  - job_name: resumelens_local_node
+    static_configs:
+      - targets: ["local_product:9100"]
+        labels:
+          deployment: local

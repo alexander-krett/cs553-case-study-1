@@ -1,98 +1,143 @@
-from unittest.mock import Mock, call, ANY
-import httpx
+from types import SimpleNamespace
+from unittest.mock import Mock
+
 import pytest
+
 import app
 
 ARGS = ("Resume", "General Resume Review", "", 512, 0.3)
 
-@pytest.fixture(autouse=True)
-def credentials(monkeypatch):
-    monkeypatch.setenv("HF_TOKEN", "test-secret")
 
-@pytest.mark.parametrize("mode", ["Local", "Remote"])
-def test_first_mode(monkeypatch, mode):
-    first = Mock(return_value=("feedback", "info"))
-    other = Mock()
-    monkeypatch.setattr(app, mode.lower() + "_resume_review", first)
-    monkeypatch.setattr(app, ("remote" if mode == "Local" else "local") + "_resume_review", other)
-    assert app.analyze_resume(*ARGS, True, mode, app.LOCAL_PRIMARY_MODEL) == ("feedback", "info")
-    other.assert_not_called()
+@pytest.fixture(params=["local", "api"])
+def mode(request, monkeypatch):
+    monkeypatch.setattr(app, "PRODUCT_MODE", request.param)
+    return request.param
 
-@pytest.mark.parametrize("mode", ["Local", "Remote"])
-def test_cross_mode_failover(monkeypatch, mode):
-    monkeypatch.setattr(app, mode.lower() + "_resume_review", Mock(side_effect=RuntimeError("unavailable")))
-    other = "remote" if mode == "Local" else "local"
-    monkeypatch.setattr(app, other + "_resume_review", Mock(return_value=("feedback", "Response time: 1")))
-    assert "Switched from" in app.analyze_resume(*ARGS, True, mode, app.LOCAL_PRIMARY_MODEL)[1]
 
-@pytest.mark.parametrize("execution", ["local", "remote"])
-def test_backup(monkeypatch, execution):
-    run = Mock(side_effect=[httpx.ReadTimeout("timeout"), "feedback"])
-    monkeypatch.setattr(app, "_run_" + execution + "_model", run)
-    assert "Backup model used" in getattr(app, execution + "_resume_review")(*ARGS)[1]
-    assert run.call_count == 2
+def _review_name(mode):
+    return "remote_resume_review" if mode == "api" else "local_resume_review"
 
-@pytest.mark.parametrize("model", [app.LOCAL_PRIMARY_MODEL, app.REMOTE_BACKUP_MODEL])
-def test_manual_selection(monkeypatch, model):
-    execution = app.MODEL_EXECUTION[model].lower()
+
+def _run_name(mode):
+    return "_run_remote_model" if mode == "api" else "_run_local_model"
+
+
+def test_failover_dispatches_to_active_product(mode, monkeypatch):
     review = Mock(return_value=("feedback", "info"))
-    monkeypatch.setattr(app, execution + "_resume_review", review)
-    app.analyze_resume(*ARGS, False, "Local", model)
-    review.assert_called_once_with(*ARGS, models=[model])
+    monkeypatch.setattr(app, _review_name(mode), review)
+    assert app.analyze_resume(*ARGS, True, None, "hf_test") == ("feedback", "info")
+    review.assert_called_once()
+    assert review.call_args.kwargs["models"] is None
 
-def test_missing_token(monkeypatch):
-    monkeypatch.delenv("HF_TOKEN")
-    with pytest.raises(RuntimeError, match="HF_TOKEN is required"):
-        app.require_hf_token()
-    with pytest.raises(RuntimeError, match="HF_TOKEN is required"):
-        app.remote_resume_review(*ARGS)
 
-def test_validation_before_failover(monkeypatch):
+def test_backup_model_used(mode, monkeypatch):
+    run = Mock(side_effect=[TimeoutError("timeout"), "feedback"])
+    monkeypatch.setattr(app, _run_name(mode), run)
+    response, information = app.analyze_resume(*ARGS, True, None, "hf_test")
+    assert response == "feedback"
+    assert "Backup model used" in information
+    assert [c.args[0] for c in run.call_args_list] == list(app.product_models())
+
+
+def test_manual_selection_uses_only_selected_model(mode, monkeypatch):
+    backup = app.product_models()[1]
+    review = Mock(return_value=("feedback", "info"))
+    monkeypatch.setattr(app, _review_name(mode), review)
+    app.analyze_resume(*ARGS, False, backup, "hf_test")
+    assert review.call_args.kwargs["models"] == [backup]
+
+
+def test_model_from_other_product_is_rejected(mode, monkeypatch):
+    other = "api" if mode == "local" else "local"
     run = Mock()
-    monkeypatch.setattr(app, "_run_local_model", run)
-    with pytest.raises(app.gr.Error, match="paste a resume"):
-        app.analyze_resume("", *ARGS[1:], True, "Local", app.LOCAL_PRIMARY_MODEL)
+    monkeypatch.setattr(app, _run_name(mode), run)
+    with pytest.raises(app.gr.Error, match="Invalid model"):
+        app.analyze_resume(*ARGS, False, app.PRODUCT_MODELS[other][0], "hf_test")
     run.assert_not_called()
 
-def test_invalid_selection():
-    with pytest.raises(app.gr.Error, match="Invalid model"):
-        app.analyze_resume(*ARGS, False, "Local", "invalid")
-    with pytest.raises(app.gr.Error, match="Invalid inference mode"):
-        app.analyze_resume(*ARGS, True, "invalid", app.LOCAL_PRIMARY_MODEL)
 
-def test_combined_errors_redact_credentials(monkeypatch):
-    monkeypatch.setattr(app, "_run_local_model", Mock(side_effect=RuntimeError("test-secret")))
-    monkeypatch.setattr(app, "_run_remote_model", Mock(side_effect=RuntimeError("test-secret")))
+def test_validation_before_inference(mode, monkeypatch):
+    run = Mock()
+    monkeypatch.setattr(app, _run_name(mode), run)
+    with pytest.raises(app.gr.Error, match="paste a resume"):
+        app.analyze_resume("", *ARGS[1:], True, None, "hf_test")
+    run.assert_not_called()
+
+
+def test_token_comes_only_from_ui(monkeypatch):
+    monkeypatch.setattr(app, "PRODUCT_MODE", "api")
+    monkeypatch.setenv("HF_TOKEN", "env-secret")
+    run = Mock()
+    monkeypatch.setattr(app, "_run_remote_model", run)
+    with pytest.raises(app.gr.Error, match="token is required"):
+        app.analyze_resume(*ARGS, True, None, "  ")
+    run.assert_not_called()
+
+    run.return_value = "feedback"
+    app.analyze_resume(*ARGS, True, None, " hf_ui ")
+    assert run.call_args.args[1] == "hf_ui"
+
+
+def test_errors_redact_ui_token(monkeypatch):
+    monkeypatch.setattr(app, "PRODUCT_MODE", "api")
+    monkeypatch.setattr(app, "_run_remote_model", Mock(side_effect=RuntimeError("bad hf_secret")))
     with pytest.raises(app.gr.Error) as error:
-        app.analyze_resume(*ARGS, True, "Local", app.LOCAL_PRIMARY_MODEL)
-    assert "test-secret" not in str(error.value)
+        app.analyze_resume(*ARGS, True, None, "hf_secret")
+    assert "hf_secret" not in str(error.value)
+    assert "[redacted]" in str(error.value)
+
 
 def test_remote_empty_response(monkeypatch):
     client = Mock()
     client.chat_completion.return_value = Mock(choices=[Mock(message=Mock(content=""), finish_reason="length")])
     monkeypatch.setattr(app, "InferenceClient", Mock(return_value=client))
     with pytest.raises(RuntimeError, match="empty response"):
-        app._run_remote_model(app.REMOTE_PRIMARY_MODEL, "test-secret", "prompt", 512, .3)
+        app._run_remote_model(app.REMOTE_PRIMARY_MODEL, "hf_test", "prompt", 512, .3)
     assert client.chat_completion.call_args.kwargs["extra_body"] == {"reasoning_effort": "low"}
 
-@pytest.mark.parametrize("token_count,content,expected_error", [(100," feedback ",None),(4096,"feedback","exceeds local context"),(100,"","empty response")])
+
+class FakeTokenizer:
+    pad_token_id = None
+    eos_token_id = 2
+
+    def __init__(self, token_count, content):
+        self.token_count = token_count
+        self.content = content
+        self.template_kwargs = None
+
+    def apply_chat_template(self, messages, **kwargs):
+        self.template_kwargs = kwargs
+        return "formatted"
+
+    def __call__(self, text, **kwargs):
+        return {"input_ids": SimpleNamespace(shape=(1, self.token_count))}
+
+    def decode(self, tokens, skip_special_tokens):
+        assert tokens == ["new"]
+        return self.content
+
+
+@pytest.mark.parametrize("token_count,content,expected_error", [
+    (100, " feedback ", None),
+    (4096, "feedback", "exceeds local context"),
+    (100, "<think>\n\n</think>\n\n", "empty response"),
+])
 def test_local_capacity_and_response(monkeypatch, token_count, content, expected_error):
-    client = Mock()
-    client.post.side_effect = [Mock(json=lambda: {"prompt":"formatted"}), Mock(json=lambda: {"tokens":[1]*token_count}), Mock(json=lambda: {"choices":[{"message":{"content":content}}]})]
-    manager = Mock()
-    manager.__enter__ = Mock(return_value=client)
-    manager.__exit__ = Mock(return_value=False)
-    monkeypatch.setattr(app.httpx, "Client", Mock(return_value=manager))
+    tokenizer = FakeTokenizer(token_count, content)
+    model = Mock()
+    model.generate.return_value = [["prompt"] * token_count + ["new"]]
+    monkeypatch.setattr(app, "_load_local_model", Mock(return_value=(tokenizer, model)))
     if expected_error:
         with pytest.raises(RuntimeError, match=expected_error):
             app._run_local_model(app.LOCAL_PRIMARY_MODEL, "prompt", 512, .3)
     else:
         assert app._run_local_model(app.LOCAL_PRIMARY_MODEL, "prompt", 512, .3) == "feedback"
-        assert client.post.call_args.kwargs["json"]["chat_template_kwargs"] == {"enable_thinking":False}
+        assert model.generate.call_args.kwargs["pad_token_id"] == 2
+    assert tokenizer.template_kwargs["enable_thinking"] is False
     if token_count == 4096:
-        assert client.post.call_count == 2
+        model.generate.assert_not_called()
 
-def test_control_visibility():
-    mode, model = app.execution_control_visibility(True)
-    assert mode.get_config()["visible"]
-    assert not model.get_config()["visible"]
+
+def test_model_picker_state():
+    assert not app.model_picker_state(True).get_config()["interactive"]
+    assert app.model_picker_state(False).get_config()["interactive"]

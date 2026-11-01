@@ -1,59 +1,127 @@
 from __future__ import annotations
 
 import os
-import json
+import threading
 import time
 from pathlib import Path
 
 import gradio as gr
-import httpx
 from dotenv import load_dotenv
 from huggingface_hub import InferenceClient
+from prometheus_client import Counter, Gauge, Histogram, start_http_server
 
 from src.examples import EXAMPLES
 from src.prompts import REVIEW_TYPES, SYSTEM_PROMPT, build_prompt
 
 
 load_dotenv(Path(__file__).resolve().parent / ".env")
+
+# One container runs one product: "api" (Hugging Face Inference API) or
+# "local" (CPU transformers model inside the container).
+PRODUCT_MODE = os.getenv("PRODUCT_MODE", "local").strip().lower()
+if PRODUCT_MODE not in {"api", "local"}:
+    raise RuntimeError(f"PRODUCT_MODE must be 'api' or 'local', not {PRODUCT_MODE!r}")
+
+ROOT_PATH = os.getenv("ROOT_PATH", "")
+APP_VERSION = os.getenv("APP_VERSION", "dev")
+METRICS_PORT = int(os.getenv("METRICS_PORT", "8000"))
 INFERENCE_TIMEOUT = float(os.getenv("INFERENCE_TIMEOUT", "300"))
-LOCAL_BASE_URL = os.getenv("LOCAL_BASE_URL", "http://127.0.0.1:8080").rstrip("/")
 LOCAL_CONTEXT_SIZE = int(os.getenv("LOCAL_CONTEXT_SIZE", "4096"))
-RESOURCE_STATUS_FILE = Path(os.getenv(
-    "RESUMELENS_STATUS_PATH", "/run/resumelens-monitor/status.json"
-))
+LOCAL_TORCH_DTYPE = os.getenv("LOCAL_TORCH_DTYPE", "auto")
 
-
-def require_hf_token():
-    token = os.getenv("HF_TOKEN", "").strip()
-    if not token:
-        raise RuntimeError("HF_TOKEN is required; deploy with a root hf-token file.")
-    return token
-
-
-LOCAL_PRIMARY_MODEL = os.getenv("LOCAL_PRIMARY_MODEL", "Qwen/Qwen3-0.6B-GGUF")
-LOCAL_BACKUP_MODEL = os.getenv("LOCAL_BACKUP_MODEL", "LiquidAI/LFM2.5-1.2B-Instruct-GGUF")
+LOCAL_PRIMARY_MODEL = os.getenv("LOCAL_PRIMARY_MODEL", "Qwen/Qwen3-0.6B")
+LOCAL_BACKUP_MODEL = os.getenv("LOCAL_BACKUP_MODEL", "LiquidAI/LFM2.5-1.2B-Instruct")
 REMOTE_PRIMARY_MODEL = os.getenv("REMOTE_PRIMARY_MODEL", "openai/gpt-oss-20b")
 REMOTE_BACKUP_MODEL = os.getenv("REMOTE_BACKUP_MODEL", "zai-org/GLM-5.3-Flash")
 
-MODEL_EXECUTION = {
-    LOCAL_PRIMARY_MODEL: "Local",
-    LOCAL_BACKUP_MODEL: "Local",
-    REMOTE_PRIMARY_MODEL: "Remote",
-    REMOTE_BACKUP_MODEL: "Remote",
+PRODUCT_MODELS = {
+    "local": (LOCAL_PRIMARY_MODEL, LOCAL_BACKUP_MODEL),
+    "api": (REMOTE_PRIMARY_MODEL, REMOTE_BACKUP_MODEL),
 }
-MODEL_CHOICES = [
-    ("Remote — GPT-OSS 20B", REMOTE_PRIMARY_MODEL),
-    ("Remote — GLM 5.3 Flash", REMOTE_BACKUP_MODEL),
-    ("Local — Qwen3 0.6B", LOCAL_PRIMARY_MODEL),
-    ("Local — LFM2.5 1.2B", LOCAL_BACKUP_MODEL),
-]
+MODEL_LABELS = {
+    LOCAL_PRIMARY_MODEL: "Qwen3 0.6B (primary)",
+    LOCAL_BACKUP_MODEL: "LFM2.5 1.2B (backup)",
+    REMOTE_PRIMARY_MODEL: "GPT-OSS 20B (primary)",
+    REMOTE_BACKUP_MODEL: "GLM 5.3 Flash (backup)",
+}
+
+
+def product_models():
+    """Return (primary, backup) model IDs for the active product."""
+    return PRODUCT_MODELS[PRODUCT_MODE]
+
+
+# --- Prometheus metrics (served on METRICS_PORT, scraped by Prometheus) ---
+REQUESTS = Counter(
+    "resumelens_requests_total",
+    "Resume reviews handled, by outcome.",
+    ["product", "result"],
+)
+REQUEST_DURATION = Histogram(
+    "resumelens_request_duration_seconds",
+    "End-to-end resume review time, including validation and failover.",
+    ["product"],
+    buckets=(0.5, 1, 2, 5, 10, 20, 30, 60, 120, 180, 300, 600),
+)
+IN_PROGRESS = Gauge(
+    "resumelens_in_progress_requests",
+    "Resume reviews currently being processed.",
+    ["product"],
+)
+INPUT_CHARACTERS = Histogram(
+    "resumelens_input_characters",
+    "Characters submitted per review (resume plus job description).",
+    ["product"],
+    buckets=(100, 250, 500, 1000, 2000, 4000, 8000, 16000, 32000),
+)
+OUTPUT_CHARACTERS = Histogram(
+    "resumelens_output_characters",
+    "Characters returned per successful review.",
+    ["product"],
+    buckets=(100, 250, 500, 1000, 2000, 4000, 8000, 16000),
+)
+MODEL_CALLS = Counter(
+    "resumelens_model_calls_total",
+    "Individual model attempts, including failover attempts.",
+    ["product", "model", "result"],
+)
+ERRORS = Counter(
+    "resumelens_errors_total",
+    "Failed reviews, by error type.",
+    ["product", "error_type"],
+)
+BUILD_INFO = Gauge(
+    "resumelens_build_info",
+    "Static build and configuration information (always 1).",
+    ["product", "version", "primary_model", "backup_model"],
+)
+
+
+def _review_error(message, error_type):
+    error = gr.Error(message)
+    error.error_type = error_type
+    return error
+
+
+def _is_timeout(error):
+    return isinstance(error, TimeoutError) or "timeout" in type(error).__name__.lower()
+
+
+def require_hf_token(token):
+    """Return the token typed into the UI; environment variables are never read."""
+    token = (token or "").strip()
+    if not token:
+        raise _review_error(
+            "A Hugging Face token is required. Enter it in the sidebar.", "missing_token"
+        )
+    return token
 
 
 def _validated_prompt(resume_text, review_type, job_description):
     try:
         return build_prompt(resume_text, review_type, job_description)
     except ValueError as error:
-        raise gr.Error(str(error)) from error
+        raise _review_error(str(error), "validation") from error
 
 
 def _messages(prompt):
@@ -63,42 +131,8 @@ def _messages(prompt):
     ]
 
 
-def _run_local_model(model_id, prompt, max_tokens, temperature):
-    messages = _messages(prompt)
-    with httpx.Client(
-        base_url=LOCAL_BASE_URL,
-        timeout=INFERENCE_TIMEOUT,
-        limits=httpx.Limits(max_keepalive_connections=0),
-    ) as client:
-        template = client.post("/apply-template", json={
-            "model": model_id, "messages": messages,
-            "chat_template_kwargs": {"enable_thinking": False},
-        })
-        template.raise_for_status()
-        tokens = client.post("/tokenize", json={
-            "model": model_id, "content": template.json()["prompt"],
-            "add_special": True, "parse_special": True,
-        })
-        tokens.raise_for_status()
-        if len(tokens.json()["tokens"]) + int(max_tokens) > LOCAL_CONTEXT_SIZE:
-            raise RuntimeError("Input plus requested response exceeds local context; shorten input or reduce response tokens.")
-        result = client.post("/v1/chat/completions", json={
-            "model": model_id, "messages": messages,
-            "max_tokens": int(max_tokens), "temperature": float(temperature),
-            "top_p": 0.95, "stream": False,
-            "chat_template_kwargs": {"enable_thinking": False},
-            "cache_prompt": True,
-        })
-        result.raise_for_status()
-        response = result.json()["choices"][0]["message"].get("content", "")
-    if not response or not response.strip():
-        raise RuntimeError("the model returned an empty response")
-    return response.strip()
-
-
-def _safe_error(error):
+def _safe_error(error, token=""):
     # Provider exceptions can include request credentials or URLs.
-    token = os.getenv("HF_TOKEN", "")
     message = str(error)
     return message.replace(token, "[redacted]") if token else message
 
@@ -116,28 +150,102 @@ Response time: {elapsed_time:.2f} seconds
 """
 
 
-def local_resume_review(
-    resume_text, review_type, job_description, max_tokens, temperature, models=None
-):
-    """Analyze a resume locally, optionally failing over to a backup model."""
-    prompt = _validated_prompt(resume_text, review_type, job_description)
-    candidates = models or [LOCAL_PRIMARY_MODEL, LOCAL_BACKUP_MODEL]
+def _review_with_failover(candidates, run, execution, token=""):
+    """Try each model in order, recording every attempt."""
     failures = []
+    timeouts = 0
     start_time = time.perf_counter()
 
     for index, model_id in enumerate(candidates):
         try:
-            response = _run_local_model(model_id, prompt, max_tokens, temperature)
-            elapsed_time = time.perf_counter() - start_time
-            return response, _inference_information(
-                model_id, "Local CPU (llama.cpp)", elapsed_time, index > 0
-            )
+            response = run(model_id)
         except Exception as error:
-            failures.append(f"{model_id}: {_safe_error(error)}")
+            MODEL_CALLS.labels(PRODUCT_MODE, model_id, "error").inc()
+            timeouts += _is_timeout(error)
+            failures.append(f"{model_id}: {_safe_error(error, token)}")
+            continue
+        MODEL_CALLS.labels(PRODUCT_MODE, model_id, "success").inc()
+        elapsed_time = time.perf_counter() - start_time
+        return response, _inference_information(
+            model_id, execution, elapsed_time, index > 0
+        )
 
-    raise gr.Error("Local inference failed. " + " | ".join(failures))
+    error_type = "timeout" if timeouts == len(candidates) else "inference"
+    raise _review_error(f"{execution} inference failed. " + " | ".join(failures), error_type)
 
 
+# --- Local CPU inference (transformers) ---
+# Only one model stays resident so the container fits on the shared VM.
+_local_lock = threading.RLock()
+_local_cache = {}
+
+
+def _load_local_model(model_id):
+    with _local_lock:
+        if model_id not in _local_cache:
+            # Imported lazily so the API product and tests do not load torch.
+            from transformers import AutoModelForCausalLM, AutoTokenizer
+
+            _local_cache.clear()
+            tokenizer = AutoTokenizer.from_pretrained(model_id)
+            model = AutoModelForCausalLM.from_pretrained(model_id, dtype=LOCAL_TORCH_DTYPE)
+            model.eval()
+            _local_cache[model_id] = (tokenizer, model)
+        return _local_cache[model_id]
+
+
+def _warm_local_model():
+    try:
+        _load_local_model(LOCAL_PRIMARY_MODEL)
+        print(f"Loaded {LOCAL_PRIMARY_MODEL}", flush=True)
+    except Exception as error:
+        print(f"Could not preload {LOCAL_PRIMARY_MODEL}: {error}", flush=True)
+
+
+def _run_local_model(model_id, prompt, max_tokens, temperature):
+    with _local_lock:
+        tokenizer, model = _load_local_model(model_id)
+        text = tokenizer.apply_chat_template(
+            _messages(prompt),
+            tokenize=False,
+            add_generation_prompt=True,
+            enable_thinking=False,
+        )
+        inputs = tokenizer(text, return_tensors="pt", add_special_tokens=False)
+        input_length = inputs["input_ids"].shape[-1]
+        if input_length + int(max_tokens) > LOCAL_CONTEXT_SIZE:
+            raise RuntimeError("Input plus requested response exceeds local context; shorten input or reduce response tokens.")
+
+        pad_token_id = tokenizer.pad_token_id
+        generation = {
+            "max_new_tokens": int(max_tokens),
+            "do_sample": float(temperature) > 0,
+            "pad_token_id": tokenizer.eos_token_id if pad_token_id is None else pad_token_id,
+        }
+        if generation["do_sample"]:
+            generation.update(temperature=float(temperature), top_p=0.95)
+        output = model.generate(**inputs, **generation)
+        response = tokenizer.decode(output[0][input_length:], skip_special_tokens=True)
+
+    response = response.split("</think>")[-1]
+    if not response.strip():
+        raise RuntimeError("the model returned an empty response")
+    return response.strip()
+
+
+def local_resume_review(
+    resume_text, review_type, job_description, max_tokens, temperature, models=None
+):
+    """Analyze a resume on the container CPU, failing over to the backup model."""
+    prompt = _validated_prompt(resume_text, review_type, job_description)
+    return _review_with_failover(
+        models or list(PRODUCT_MODELS["local"]),
+        lambda model_id: _run_local_model(model_id, prompt, max_tokens, temperature),
+        "Local CPU (transformers)",
+    )
+
+
+# --- Remote inference (Hugging Face Inference API) ---
 def _remote_extra_body(model_id):
     if model_id == REMOTE_PRIMARY_MODEL:
         return {"reasoning_effort": "low"}
@@ -168,79 +276,33 @@ def _run_remote_model(model_id, token, prompt, max_tokens, temperature):
 
 
 def remote_resume_review(
-    resume_text,
-    review_type,
-    job_description,
-    max_tokens,
-    temperature,
-    models=None,
+    resume_text, review_type, job_description, max_tokens, temperature, token, models=None
 ):
-    """Analyze a resume remotely, optionally failing over to a backup model."""
-    token = require_hf_token()
-
+    """Analyze a resume remotely with the user's token, failing over to the backup model."""
     prompt = _validated_prompt(resume_text, review_type, job_description)
-    candidates = models or [REMOTE_PRIMARY_MODEL, REMOTE_BACKUP_MODEL]
-    failures = []
-    start_time = time.perf_counter()
-
-    for index, model_id in enumerate(candidates):
-        try:
-            response = _run_remote_model(
-                model_id, token, prompt, max_tokens, temperature
-            )
-            elapsed_time = time.perf_counter() - start_time
-            return response, _inference_information(
-                model_id, "Remote Hugging Face API", elapsed_time, index > 0
-            )
-        except Exception as error:
-            failures.append(f"{model_id}: {_safe_error(error)}")
-
-    raise gr.Error("Remote inference failed. " + " | ".join(failures))
+    token = require_hf_token(token)
+    return _review_with_failover(
+        models or list(PRODUCT_MODELS["api"]),
+        lambda model_id: _run_remote_model(model_id, token, prompt, max_tokens, temperature),
+        "Remote Hugging Face API",
+        token,
+    )
 
 
-def automatic_resume_review(
-    resume_text,
-    review_type,
-    job_description,
-    max_tokens,
-    temperature,
-    first_execution,
+def _route_review(
+    resume_text, review_type, job_description, max_tokens, temperature,
+    automatic_failover, selected_model, hf_token,
 ):
-    """Try both models in one execution mode, then cross to the other mode."""
-    if first_execution not in {"Local", "Remote"}:
-        raise gr.Error(f"Invalid inference mode: {first_execution}")
+    models = None
+    if not automatic_failover:
+        if selected_model not in product_models():
+            raise _review_error(f"Invalid model: {selected_model}", "validation")
+        models = [selected_model]
 
-    # Reject user-input errors before attempting infrastructure failover.
-    _validated_prompt(resume_text, review_type, job_description)
-    common_args = (
-        resume_text,
-        review_type,
-        job_description,
-        max_tokens,
-        temperature,
-    )
-    attempts = (
-        ("Local", lambda: local_resume_review(*common_args)),
-        ("Remote", lambda: remote_resume_review(*common_args)),
-    )
-    if first_execution == "Remote":
-        attempts = tuple(reversed(attempts))
-
-    failures = []
-    for index, (execution, review) in enumerate(attempts):
-        try:
-            response, information = review()
-            if index > 0:
-                information = information.replace(
-                    "Response time:",
-                    f"Failover: Switched from {first_execution} to {execution}\n\n"
-                    "Response time:",
-                )
-            return response, information
-        except Exception as error:
-            failures.append(f"{execution}: {_safe_error(error)}")
-
-    raise gr.Error("All inference options failed. " + " || ".join(failures))
+    common_args = (resume_text, review_type, job_description, max_tokens, temperature)
+    if PRODUCT_MODE == "api":
+        return remote_resume_review(*common_args, hf_token, models=models)
+    return local_resume_review(*common_args, models=models)
 
 
 def analyze_resume(
@@ -250,96 +312,80 @@ def analyze_resume(
     max_tokens,
     temperature,
     automatic_failover,
-    inference_mode,
     selected_model,
+    hf_token="",
 ):
-    """Route a review using automatic failover or one explicitly selected model."""
-    if automatic_failover:
-        return automatic_resume_review(
-            resume_text,
-            review_type,
-            job_description,
-            max_tokens,
-            temperature,
-            inference_mode,
-        )
-
-    execution = MODEL_EXECUTION.get(selected_model)
-    if execution == "Local":
-        return local_resume_review(
-            resume_text,
-            review_type,
-            job_description,
-            max_tokens,
-            temperature,
-            models=[selected_model],
-        )
-    if execution == "Remote":
-        return remote_resume_review(
-            resume_text,
-            review_type,
-            job_description,
-            max_tokens,
-            temperature,
-            models=[selected_model],
-        )
-    raise gr.Error(f"Invalid model: {selected_model}")
-
-
-def execution_control_visibility(automatic_failover):
-    """Show the mode toggle for failover or the model picker for direct use."""
-    return (
-        gr.Radio(visible=automatic_failover),
-        gr.Dropdown(visible=not automatic_failover),
+    """Gradio entry point: route the review and record product metrics."""
+    start_time = time.perf_counter()
+    IN_PROGRESS.labels(PRODUCT_MODE).inc()
+    INPUT_CHARACTERS.labels(PRODUCT_MODE).observe(
+        len(resume_text or "") + len(job_description or "")
     )
-
-
-def resource_capacity_status():
-    """Show current VM resources and a warning while the monitor reports overload."""
     try:
-        status = json.loads(RESOURCE_STATUS_FILE.read_text())
-        age = time.time() - float(status["timestamp"])
-        cpu = float(status["cpu_percent"])
-        memory = float(status["memory_percent"])
-        if age < 0 or age > 6 or not 0 <= cpu <= 100 or not 0 <= memory <= 100:
-            raise ValueError("stale or invalid monitor status")
-    except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
-        return "⚠️ **Resource monitoring unavailable** — ResumeLens is still accepting reviews."
-
-    measurements = f"CPU **{cpu:.0f}%** · Memory **{memory:.0f}%**"
-    if status.get("overloaded"):
-        return (
-            f"🟠 **Near capacity** — {measurements}. "
-            "New reviews remain available; responses may take longer."
+        response, information = _route_review(
+            resume_text, review_type, job_description, max_tokens, temperature,
+            automatic_failover, selected_model, hf_token,
         )
-    return f"🟢 **Operating normally** — {measurements}."
+    except Exception as error:
+        REQUESTS.labels(PRODUCT_MODE, "error").inc()
+        ERRORS.labels(PRODUCT_MODE, getattr(error, "error_type", "inference")).inc()
+        raise
+    finally:
+        REQUEST_DURATION.labels(PRODUCT_MODE).observe(time.perf_counter() - start_time)
+        IN_PROGRESS.labels(PRODUCT_MODE).dec()
+
+    REQUESTS.labels(PRODUCT_MODE, "success").inc()
+    OUTPUT_CHARACTERS.labels(PRODUCT_MODE).observe(len(response))
+    return response, information
+
+
+def model_picker_state(automatic_failover):
+    """Enable the model picker only when automatic failover is off."""
+    return gr.Dropdown(interactive=not automatic_failover)
+
+
+PRIMARY_MODEL, BACKUP_MODEL = product_models()
+BUILD_INFO.labels(PRODUCT_MODE, APP_VERSION, PRIMARY_MODEL, BACKUP_MODEL).set(1)
+
+if PRODUCT_MODE == "api":
+    PRODUCT_DESCRIPTION = (
+        "Analyze a resume with a hosted model through the Hugging Face Inference API. "
+        "Enter your own Hugging Face token in the sidebar; it is used only for your request."
+    )
+else:
+    PRODUCT_DESCRIPTION = (
+        "Analyze a resume with a small language model running on this container's CPU. "
+        "The first review can take a few minutes while the model loads."
+    )
 
 
 with gr.Blocks(title="ResumeLens AI") as demo:
     with gr.Sidebar():
         gr.Markdown("## Inference")
+        hf_token = gr.Textbox(
+            label="Hugging Face token",
+            type="password",
+            placeholder="hf_...",
+            info="Needs inference-provider permission. Not stored.",
+            visible=PRODUCT_MODE == "api",
+        )
 
         with gr.Accordion("Advanced settings", open=False):
             automatic_failover = gr.Checkbox(
                 value=True,
                 label="Automatic failover",
-                info="Try all four models, starting with the selected execution.",
-            )
-            inference_mode = gr.Radio(
-                choices=["Local", "Remote"],
-                value="Local",
-                label="Start with",
+                info="Try the primary model, then the backup model.",
             )
             selected_model = gr.Dropdown(
-                choices=MODEL_CHOICES,
-                value=LOCAL_PRIMARY_MODEL,
+                choices=[(MODEL_LABELS.get(m, m), m) for m in (PRIMARY_MODEL, BACKUP_MODEL)],
+                value=PRIMARY_MODEL,
                 label="Model",
-                visible=False,
+                interactive=False,
             )
             max_tokens = gr.Slider(
                 minimum=256,
                 maximum=2048,
-                value=2048,
+                value=2048 if PRODUCT_MODE == "api" else 1024,
                 step=32,
                 label="Maximum Response Tokens",
             )
@@ -352,11 +398,10 @@ with gr.Blocks(title="ResumeLens AI") as demo:
             )
 
     gr.Markdown(
-        """
-# ResumeLens AI
+        f"""
+# ResumeLens AI — {"API" if PRODUCT_MODE == "api" else "Local CPU"} product
 
-Analyze a resume with a CPU model running on this server or a remotely
-hosted model through the Hugging Face Inference API.
+{PRODUCT_DESCRIPTION}
 
 **For this class demonstration, use a synthetic or sanitized resume whenever possible.**
 """
@@ -394,19 +439,21 @@ hosted model through the Hugging Face Inference API.
             max_tokens,
             temperature,
             automatic_failover,
-            inference_mode,
             selected_model,
+            hf_token,
         ],
         outputs=[feedback, model_information],
     )
     automatic_failover.change(
-        fn=execution_control_visibility,
+        fn=model_picker_state,
         inputs=automatic_failover,
-        outputs=[inference_mode, selected_model],
+        outputs=selected_model,
     )
 
 demo.queue(default_concurrency_limit=1, max_size=8)
 
 if __name__ == "__main__":
-    require_hf_token()
-    demo.launch(server_name="0.0.0.0", server_port=7860, share=False)
+    start_http_server(METRICS_PORT)
+    if PRODUCT_MODE == "local":
+        threading.Thread(target=_warm_local_model, daemon=True).start()
+    demo.launch(server_name="0.0.0.0", server_port=7860, root_path=ROOT_PATH, share=False)

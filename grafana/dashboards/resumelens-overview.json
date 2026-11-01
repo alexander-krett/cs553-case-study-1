@@ -1,0 +1,93 @@
+{
+  "annotations": {"list": []},
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "panels": [
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {"unit": "reqps"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 0},
+      "id": 1,
+      "targets": [{"expr": "sum by (product) (rate(resumelens_requests_total[5m]))", "legendFormat": "{{product}}", "refId": "A"}],
+      "title": "Request rate by product",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {"max": 1, "min": 0, "unit": "percentunit"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 0},
+      "id": 2,
+      "targets": [{"expr": "sum by (product) (rate(resumelens_requests_total{result=\"success\"}[5m])) / clamp_min(sum by (product) (rate(resumelens_requests_total[5m])), 0.000001)", "legendFormat": "{{product}}", "refId": "A"}],
+      "title": "Success fraction",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {"unit": "s"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 8},
+      "id": 3,
+      "targets": [{"expr": "histogram_quantile(0.95, sum by (le, product) (rate(resumelens_request_duration_seconds_bucket[5m])))", "legendFormat": "p95 {{product}}", "refId": "A"}],
+      "title": "95th-percentile request duration",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {"unit": "short"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 8},
+      "id": 4,
+      "targets": [{"expr": "resumelens_in_progress_requests", "legendFormat": "{{product}}", "refId": "A"}],
+      "title": "Reviews in progress",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {"unit": "percent"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 16},
+      "id": 5,
+      "targets": [{"expr": "100 * (1 - avg by (job) (rate(node_cpu_seconds_total{mode=\"idle\",job=~\"resumelens_.*_node\"}[5m])))", "legendFormat": "{{job}}", "refId": "A"}],
+      "title": "Node Exporter CPU utilization",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {"unit": "percent"}, "overrides": []},
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 16},
+      "id": 6,
+      "targets": [{"expr": "100 * (1 - node_memory_MemAvailable_bytes{job=~\"resumelens_.*_node\"} / node_memory_MemTotal_bytes{job=~\"resumelens_.*_node\"})", "legendFormat": "{{job}}", "refId": "A"}],
+      "title": "Node Exporter memory utilization",
+      "type": "timeseries"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {"mappings": [], "thresholds": {"mode": "absolute", "steps": [{"color": "red", "value": 0}, {"color": "green", "value": 1}]}}, "overrides": []},
+      "gridPos": {"h": 6, "w": 12, "x": 0, "y": 24},
+      "id": 7,
+      "options": {"colorMode": "background", "graphMode": "none", "justifyMode": "auto", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto", "wideLayout": true},
+      "targets": [{"expr": "up", "legendFormat": "{{job}}", "refId": "A"}],
+      "title": "Prometheus target health",
+      "type": "stat"
+    },
+    {
+      "datasource": {"type": "prometheus", "uid": "prometheus"},
+      "fieldConfig": {"defaults": {"unit": "ops"}, "overrides": []},
+      "gridPos": {"h": 6, "w": 12, "x": 12, "y": 24},
+      "id": 8,
+      "targets": [{"expr": "sum by (product, error_type) (increase(resumelens_errors_total[15m]))", "legendFormat": "{{product}} / {{error_type}}", "refId": "A"}],
+      "title": "Errors in the last 15 minutes",
+      "type": "timeseries"
+    }
+  ],
+  "refresh": "15s",
+  "schemaVersion": 41,
+  "tags": ["case-study-3", "resumelens"],
+  "templating": {"list": []},
+  "time": {"from": "now-1h", "to": "now"},
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "ResumeLens Case Study 3 Overview",
+  "uid": "resumelens-cs3",
+  "version": 1
+}
