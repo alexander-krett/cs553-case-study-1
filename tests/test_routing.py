@@ -96,25 +96,18 @@ def test_remote_empty_response(monkeypatch):
     assert client.chat_completion.call_args.kwargs["extra_body"] == {"reasoning_effort": "low"}
 
 
-class FakeTokenizer:
-    pad_token_id = None
-    eos_token_id = 2
-
+class FakeLlama:
     def __init__(self, token_count, content):
         self.token_count = token_count
         self.content = content
-        self.template_kwargs = None
+        self.request = None
 
-    def apply_chat_template(self, messages, **kwargs):
-        self.template_kwargs = kwargs
-        return "formatted"
+    def tokenize(self, text):
+        return [1] * self.token_count
 
-    def __call__(self, text, **kwargs):
-        return {"input_ids": SimpleNamespace(shape=(1, self.token_count))}
-
-    def decode(self, tokens, skip_special_tokens):
-        assert tokens == ["new"]
-        return self.content
+    def create_chat_completion(self, **request):
+        self.request = request
+        return {"choices": [{"message": {"content": self.content}}]}
 
 
 @pytest.mark.parametrize("token_count,content,expected_error", [
@@ -123,19 +116,32 @@ class FakeTokenizer:
     (100, "<think>\n\n</think>\n\n", "empty response"),
 ])
 def test_local_capacity_and_response(monkeypatch, token_count, content, expected_error):
-    tokenizer = FakeTokenizer(token_count, content)
-    model = Mock()
-    model.generate.return_value = [["prompt"] * token_count + ["new"]]
-    monkeypatch.setattr(app, "_load_local_model", Mock(return_value=(tokenizer, model)))
+    llm = FakeLlama(token_count, content)
+    monkeypatch.setattr(app, "_load_local_model", Mock(return_value=llm))
     if expected_error:
         with pytest.raises(RuntimeError, match=expected_error):
             app._run_local_model(app.LOCAL_PRIMARY_MODEL, "prompt", 512, .3)
     else:
         assert app._run_local_model(app.LOCAL_PRIMARY_MODEL, "prompt", 512, .3) == "feedback"
-        assert model.generate.call_args.kwargs["pad_token_id"] == 2
-    assert tokenizer.template_kwargs["enable_thinking"] is False
+        assert llm.request["max_tokens"] == 512
     if token_count == 4096:
-        model.generate.assert_not_called()
+        assert llm.request is None
+
+
+@pytest.mark.parametrize("model,suffix", [
+    (app.LOCAL_PRIMARY_MODEL, True),
+    (app.LOCAL_BACKUP_MODEL, False),
+])
+def test_qwen_thinking_is_disabled(monkeypatch, model, suffix):
+    llm = FakeLlama(10, "feedback")
+    monkeypatch.setattr(app, "_load_local_model", Mock(return_value=llm))
+    app._run_local_model(model, "prompt", 512, .3)
+    assert llm.request["messages"][-1]["content"].endswith("/no_think") is suffix
+
+
+def test_every_local_model_has_a_q4_file():
+    for model in app.PRODUCT_MODELS["local"]:
+        assert "Q4" in app.LOCAL_MODEL_FILES[model]
 
 
 def test_model_picker_state():

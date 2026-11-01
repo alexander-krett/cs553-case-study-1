@@ -11,16 +11,16 @@ dependencies = [
 
 [dependency-groups]
 dev = ["pytest>=8,<10"]
-# CPU inference for PRODUCT_MODE=local: `uv sync --group local`.
-local = ["torch==2.7.0", "transformers>=5,<6"]
+# Q4 GGUF inference for PRODUCT_MODE=local: `uv sync --group local`.
+local = ["llama-cpp-python==0.3.36"]
 
 [tool.uv]
 package = false
 
 [tool.uv.sources]
-torch = { index = "pytorch-cpu" }
+llama-cpp-python = { index = "llama-cpp-cpu" }
 
 [[tool.uv.index]]
-name = "pytorch-cpu"
-url = "https://download.pytorch.org/whl/cpu"
+name = "llama-cpp-cpu"
+url = "https://abetlen.github.io/llama-cpp-python/whl/cpu"
 explicit = true

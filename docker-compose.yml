@@ -31,10 +31,13 @@ services:
       PRODUCT_MODE: local
       ROOT_PATH: /local
       APP_VERSION: ${IMAGE_TAG:-v1}
-      LOCAL_PRIMARY_MODEL: ${LOCAL_PRIMARY_MODEL:-Qwen/Qwen3-0.6B}
-      LOCAL_BACKUP_MODEL: ${LOCAL_BACKUP_MODEL:-LiquidAI/LFM2.5-1.2B-Instruct}
+      LOCAL_PRIMARY_MODEL: ${LOCAL_PRIMARY_MODEL:-unsloth/Qwen3-0.6B-GGUF}
+      LOCAL_PRIMARY_FILE: ${LOCAL_PRIMARY_FILE:-*Q4_K_M.gguf}
+      LOCAL_BACKUP_MODEL: ${LOCAL_BACKUP_MODEL:-LiquidAI/LFM2.5-1.2B-Instruct-GGUF}
+      LOCAL_BACKUP_FILE: ${LOCAL_BACKUP_FILE:-*QAD-Q4_0.gguf}
       LOCAL_CONTEXT_SIZE: ${LOCAL_CONTEXT_SIZE:-4096}
-      LOCAL_TORCH_DTYPE: ${LOCAL_TORCH_DTYPE:-auto}
+      # llama.cpp threads should match the CPU limit below.
+      LOCAL_THREADS: ${LOCAL_CPUS:-2}
       HF_HOME: /home/resumelens/.cache/huggingface
     ports:
       - "${BIND_ADDRESS:-0.0.0.0}:${LOCAL_UI_PORT:-2102}:7860"
@@ -43,7 +46,7 @@ services:
     volumes:
       - model_cache:/home/resumelens/.cache/huggingface
     # Shared-VM courtesy: cap the CPU model's footprint.
-    mem_limit: ${LOCAL_MEM_LIMIT:-6g}
+    mem_limit: ${LOCAL_MEM_LIMIT:-3g}
     cpus: ${LOCAL_CPUS:-2}
 
   prometheus:

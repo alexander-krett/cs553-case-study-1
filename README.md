@@ -6,7 +6,7 @@ products built from one image**, each in its own container on the shared VM:
 | Product | `PRODUCT_MODE` | Models (primary → backup) | HF token |
 |---|---|---|---|
 | API-based | `api` | `openai/gpt-oss-20b` → `zai-org/GLM-5.3-Flash` (Hugging Face Inference API) | Typed into the web UI per request |
-| Locally executed | `local` | `Qwen/Qwen3-0.6B` → `LiquidAI/LFM2.5-1.2B-Instruct` (transformers on the container CPU) | Not needed |
+| Locally executed | `local` | Qwen3 0.6B Q4_K_M (`unsloth/Qwen3-0.6B-GGUF`) → LFM2.5 1.2B QAD-Q4_0 (`LiquidAI/LFM2.5-1.2B-Instruct-GGUF`), run with llama.cpp on the container CPU | Not needed |
 
 Both containers also run Prometheus Node Exporter (container port 9100) and
 expose application metrics with `prometheus_client` (container port 8000).
@@ -100,10 +100,15 @@ docker image inspect --format '{{index .RepoDigests 0}}' "$DOCKERHUB_USERNAME/re
 - **One image, two products.** `PRODUCT_MODE` picks the API or local product.
   Each container only offers its own two models, with primary → backup
   failover. The Case Study 1/2 cross-mode failover was removed.
-- **Local inference uses transformers in-process.** Previously it called an
-  external llama.cpp router. Only one model is kept resident, with a 6 GB
-  memory and 2 CPU limit on the container, out of courtesy to the shared VM.
-  `torch`/`transformers` are imported lazily, so the API product never loads them.
+- **Local inference runs 4-bit (Q4) GGUF models in-process** with
+  `llama-cpp-python`, installed from prebuilt CPU wheels so the image needs no
+  compiler. Case Study 2 used an external llama.cpp router instead. On 2 CPUs,
+  Qwen3 0.6B Q4_K_M generates about 10 tokens/s and LFM2.5 1.2B Q4_0 about 6
+  tokens/s. Unquantized bf16 transformers managed only about 1 token/s.
+  Only one model is kept resident, and the container is limited to 3 GB of
+  memory and 2 CPUs (`LOCAL_THREADS` matches the CPU limit). `llama_cpp` is
+  imported lazily, so the API product never loads it. Qwen3 receives the
+  `/no_think` switch so it answers directly.
 - **The HF token comes from the UI.** The API product has a password field in
   the sidebar. The token is used for that request only, is never stored or
   logged, and is redacted from error messages. No container receives `HF_TOKEN`.

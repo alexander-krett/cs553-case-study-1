@@ -1,7 +1,8 @@
---extra-index-url https://download.pytorch.org/whl/cpu
+# Prebuilt CPU wheels for llama-cpp-python (no compiler needed in the image).
+--extra-index-url https://abetlen.github.io/llama-cpp-python/whl/cpu
+--only-binary=llama-cpp-python
 
-torch==2.7.0+cpu
-transformers>=5,<6
+llama-cpp-python==0.3.36
 gradio>=6,<7
 huggingface_hub>=1,<2
 python-dotenv>=1,<2

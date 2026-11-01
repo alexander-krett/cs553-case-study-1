@@ -17,7 +17,7 @@ from src.prompts import REVIEW_TYPES, SYSTEM_PROMPT, build_prompt
 load_dotenv(Path(__file__).resolve().parent / ".env")
 
 # One container runs one product: "api" (Hugging Face Inference API) or
-# "local" (CPU transformers model inside the container).
+# "local" (Q4 GGUF model on the container CPU via llama.cpp).
 PRODUCT_MODE = os.getenv("PRODUCT_MODE", "local").strip().lower()
 if PRODUCT_MODE not in {"api", "local"}:
     raise RuntimeError(f"PRODUCT_MODE must be 'api' or 'local', not {PRODUCT_MODE!r}")
@@ -27,10 +27,17 @@ APP_VERSION = os.getenv("APP_VERSION", "dev")
 METRICS_PORT = int(os.getenv("METRICS_PORT", "8000"))
 INFERENCE_TIMEOUT = float(os.getenv("INFERENCE_TIMEOUT", "300"))
 LOCAL_CONTEXT_SIZE = int(os.getenv("LOCAL_CONTEXT_SIZE", "4096"))
-LOCAL_TORCH_DTYPE = os.getenv("LOCAL_TORCH_DTYPE", "auto")
+LOCAL_THREADS = int(os.getenv("LOCAL_THREADS", "2"))
 
-LOCAL_PRIMARY_MODEL = os.getenv("LOCAL_PRIMARY_MODEL", "Qwen/Qwen3-0.6B")
-LOCAL_BACKUP_MODEL = os.getenv("LOCAL_BACKUP_MODEL", "LiquidAI/LFM2.5-1.2B-Instruct")
+# Local models are Q4 GGUF files: a Hugging Face repo plus a filename pattern.
+LOCAL_PRIMARY_MODEL = os.getenv("LOCAL_PRIMARY_MODEL", "unsloth/Qwen3-0.6B-GGUF")
+LOCAL_PRIMARY_FILE = os.getenv("LOCAL_PRIMARY_FILE", "*Q4_K_M.gguf")
+LOCAL_BACKUP_MODEL = os.getenv("LOCAL_BACKUP_MODEL", "LiquidAI/LFM2.5-1.2B-Instruct-GGUF")
+LOCAL_BACKUP_FILE = os.getenv("LOCAL_BACKUP_FILE", "*QAD-Q4_0.gguf")
+LOCAL_MODEL_FILES = {
+    LOCAL_PRIMARY_MODEL: LOCAL_PRIMARY_FILE,
+    LOCAL_BACKUP_MODEL: LOCAL_BACKUP_FILE,
+}
 REMOTE_PRIMARY_MODEL = os.getenv("REMOTE_PRIMARY_MODEL", "openai/gpt-oss-20b")
 REMOTE_BACKUP_MODEL = os.getenv("REMOTE_BACKUP_MODEL", "zai-org/GLM-5.3-Flash")
 
@@ -39,8 +46,8 @@ PRODUCT_MODELS = {
     "api": (REMOTE_PRIMARY_MODEL, REMOTE_BACKUP_MODEL),
 }
 MODEL_LABELS = {
-    LOCAL_PRIMARY_MODEL: "Qwen3 0.6B (primary)",
-    LOCAL_BACKUP_MODEL: "LFM2.5 1.2B (backup)",
+    LOCAL_PRIMARY_MODEL: "Qwen3 0.6B Q4_K_M (primary)",
+    LOCAL_BACKUP_MODEL: "LFM2.5 1.2B Q4_0 (backup)",
     REMOTE_PRIMARY_MODEL: "GPT-OSS 20B (primary)",
     REMOTE_BACKUP_MODEL: "GLM 5.3 Flash (backup)",
 }
@@ -174,7 +181,7 @@ def _review_with_failover(candidates, run, execution, token=""):
     raise _review_error(f"{execution} inference failed. " + " | ".join(failures), error_type)
 
 
-# --- Local CPU inference (transformers) ---
+# --- Local CPU inference (llama.cpp, Q4 GGUF) ---
 # Only one model stays resident so the container fits on the shared VM.
 _local_lock = threading.RLock()
 _local_cache = {}
@@ -183,14 +190,17 @@ _local_cache = {}
 def _load_local_model(model_id):
     with _local_lock:
         if model_id not in _local_cache:
-            # Imported lazily so the API product and tests do not load torch.
-            from transformers import AutoModelForCausalLM, AutoTokenizer
+            # Imported lazily so the API product and tests do not need llama.cpp.
+            from llama_cpp import Llama
 
             _local_cache.clear()
-            tokenizer = AutoTokenizer.from_pretrained(model_id)
-            model = AutoModelForCausalLM.from_pretrained(model_id, dtype=LOCAL_TORCH_DTYPE)
-            model.eval()
-            _local_cache[model_id] = (tokenizer, model)
+            _local_cache[model_id] = Llama.from_pretrained(
+                model_id,
+                filename=LOCAL_MODEL_FILES[model_id],
+                n_ctx=LOCAL_CONTEXT_SIZE,
+                n_threads=LOCAL_THREADS,
+                verbose=False,
+            )
         return _local_cache[model_id]
 
 
@@ -203,30 +213,24 @@ def _warm_local_model():
 
 
 def _run_local_model(model_id, prompt, max_tokens, temperature):
+    messages = _messages(prompt)
+    if "qwen3" in model_id.lower():
+        # Qwen3 soft switch: answer directly instead of reasoning first.
+        messages[-1]["content"] += "\n\n/no_think"
     with _local_lock:
-        tokenizer, model = _load_local_model(model_id)
-        text = tokenizer.apply_chat_template(
-            _messages(prompt),
-            tokenize=False,
-            add_generation_prompt=True,
-            enable_thinking=False,
-        )
-        inputs = tokenizer(text, return_tensors="pt", add_special_tokens=False)
-        input_length = inputs["input_ids"].shape[-1]
-        if input_length + int(max_tokens) > LOCAL_CONTEXT_SIZE:
+        llm = _load_local_model(model_id)
+        text = "\n".join(message["content"] for message in messages)
+        # The margin covers the chat template's role markers.
+        input_tokens = len(llm.tokenize(text.encode("utf-8"))) + 64
+        if input_tokens + int(max_tokens) > LOCAL_CONTEXT_SIZE:
             raise RuntimeError("Input plus requested response exceeds local context; shorten input or reduce response tokens.")
-
-        pad_token_id = tokenizer.pad_token_id
-        generation = {
-            "max_new_tokens": int(max_tokens),
-            "do_sample": float(temperature) > 0,
-            "pad_token_id": tokenizer.eos_token_id if pad_token_id is None else pad_token_id,
-        }
-        if generation["do_sample"]:
-            generation.update(temperature=float(temperature), top_p=0.95)
-        output = model.generate(**inputs, **generation)
-        response = tokenizer.decode(output[0][input_length:], skip_special_tokens=True)
-
+        result = llm.create_chat_completion(
+            messages=messages,
+            max_tokens=int(max_tokens),
+            temperature=float(temperature),
+            top_p=0.95,
+        )
+    response = result["choices"][0]["message"].get("content") or ""
     response = response.split("</think>")[-1]
     if not response.strip():
         raise RuntimeError("the model returned an empty response")
@@ -241,7 +245,7 @@ def local_resume_review(
     return _review_with_failover(
         models or list(PRODUCT_MODELS["local"]),
         lambda model_id: _run_local_model(model_id, prompt, max_tokens, temperature),
-        "Local CPU (transformers)",
+        "Local CPU (llama.cpp, Q4)",
     )
 
 
@@ -354,8 +358,8 @@ if PRODUCT_MODE == "api":
     )
 else:
     PRODUCT_DESCRIPTION = (
-        "Analyze a resume with a small language model running on this container's CPU. "
-        "The first review can take a few minutes while the model loads."
+        "Analyze a resume with a small 4-bit quantized model running on this container's CPU. "
+        "The first review may wait while the model downloads."
     )
 
 
